@@ -1,0 +1,7 @@
+{
+  "lua_dir_name": "lua",
+  "api_base": "https://hubcapmanifest.com/api/v1",
+  "api_key": "",
+  "main_source": "hubcap",
+  "fallback": false
+}
