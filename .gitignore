@@ -1,0 +1,6 @@
+# Your Hubcap API key + source prefs live here — NEVER commit this.
+# Copy config.example.json to config.json to get started.
+backend/config.json
+
+# Runtime state / temp files generated at install/grab time.
+backend/data/
