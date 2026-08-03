@@ -126,6 +126,60 @@ local function ensure_data_dir()
     return d
 end
 
+local function drop_file(path) pcall(fs.remove, path) end
+
+-- data/ holds one-shot scratch files per job (launcher .cmd, the source list,
+-- the helper's result, the grabbed clipboard). Nothing re-reads them once the
+-- job is done, so they'd otherwise pile up forever — one set per app/depot the
+-- user ever touched. Cleared at boot, when nothing can be in flight.
+--
+-- manifests_*.json is the cached SteamDB version list, so it's kept (it saves a
+-- re-scrape) but expired after MANIFEST_CACHE_DAYS. usage_cache.json is the
+-- Hubcap quota cache and is always kept.
+local MANIFEST_CACHE_DAYS = 14
+
+local function sweep_data_dir()
+    local dir = ensure_data_dir()
+    local ok, entries = pcall(fs.list, dir)
+    if not ok or type(entries) ~= "table" then return end
+
+    -- Only age-expire when the clock really looks like epoch SECONDS; if the
+    -- runtime ever hands back ms (or anything odd), skip expiry rather than
+    -- nuking the version cache on every boot.
+    local now = tonumber(select(2, pcall(m_utils.time))) or 0
+    if now < 1600000000 or now > 4000000000 then now = 0 end
+    local max_age = MANIFEST_CACHE_DAYS * 86400
+    local removed = 0
+
+    for _, entry in ipairs(entries) do
+        -- fs.list yields { name, path, is_file, is_directory, ... } per entry
+        local name = type(entry) == "table" and entry.name or tostring(entry)
+        name = tostring(name):match("([^/\\]+)$") or tostring(name)
+        local path = (type(entry) == "table" and entry.path) or fs.join(dir, name)
+        local is_file = (type(entry) ~= "table") or (entry.is_file ~= false)
+        local transient = is_file and (
+            name:match("^run_install_%d+%.cmd$") or
+            name:match("^run_grab_%d+%.cmd$")    or
+            name:match("^sources_%d+%.json$")    or
+            name:match("^install_%d+%.json$")    or
+            name:match("^clip_%d+%.txt$")        or
+            name == "restart_steam.cmd")
+
+        if transient then
+            drop_file(path); removed = removed + 1
+        elseif is_file and name:match("^manifests_%d+%.json$") and now > 0 then
+            local tok, mtime = pcall(fs.last_write_time, path)
+            mtime = tonumber(mtime)
+            -- only expire when the timestamp looks like sane epoch seconds
+            if tok and mtime and mtime > 0 and (now - mtime) > max_age then
+                drop_file(path); removed = removed + 1
+            end
+        end
+    end
+
+    if removed > 0 then log("cleanup: removed " .. removed .. " stale file(s) from data/") end
+end
+
 -- ── webkit injection ─────────────────────────────────────────────────────────
 
 local function copy_and_inject_webkit()
@@ -249,6 +303,11 @@ function HubcapInstallStatus(contentScriptQuery, payload)
         if not rok or type(rd) ~= "table" then return { success = true, state = "running" } end
         rd.state = "done"
         log("install: result done success=" .. tostring(rd.success))
+        -- job finished: the launcher + source list are never read again. The
+        -- result file itself stays until the next install (which clears it) so
+        -- a duplicate in-flight poll still resolves instead of hanging.
+        drop_file(fs.join(ensure_data_dir(), "run_install_" .. appid .. ".cmd"))
+        drop_file(fs.join(ensure_data_dir(), "sources_" .. appid .. ".json"))
         return rd
     end)
     if not ok then return json_err(res) end
@@ -394,6 +453,10 @@ function HubcapGrabResult(contentScriptQuery, payload)
         local rc = m_utils.read_file(result_file)
         if rc == nil then return { success = true, state = "running" } end
         rc = rc:gsub("^\239\187\191", "")
+        -- the grabbed page text can be hundreds of KB; drop it (and the
+        -- launcher) now that it's been handed to the frontend.
+        drop_file(fs.join(ensure_data_dir(), "run_grab_" .. depot .. ".cmd"))
+        drop_file(result_file)
         return { success = true, state = "done", text = rc }
     end)
     if not ok then return json_err(res) end
@@ -513,6 +576,7 @@ end
 local function on_load()
     log("Bootstrapping OSTLua, millennium " .. tostring(select(2, pcall(millennium.version))))
     ensure_config()
+    pcall(sweep_data_dir)
     copy_and_inject_webkit()
     pcall(millennium.ready)
 end
