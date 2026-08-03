@@ -140,9 +140,6 @@
       ".hubcap-install{display:flex;flex-direction:column;align-items:center;gap:14px;padding:20px 10px 8px;text-align:center;}",
       ".hubcap-install .hc-shield{width:50px;height:50px;opacity:.9;}.hubcap-install .msg{font:500 13px/1.55 'Motiva Sans';color:#aab2bf;max-width:430px;}",
       ".hubcap-depot{border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px 16px;margin-bottom:14px;background:rgba(255,255,255,.02);}",
-      ".hubcap-pin{display:flex;align-items:center;justify-content:space-between;gap:12px;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px 14px;margin:2px 0 12px;background:rgba(255,255,255,.02);}",
-      ".hubcap-pin .pi{display:flex;flex-direction:column;gap:6px;align-items:flex-start;}",
-      ".hubcap-pin .pt{font:500 12px/1.4 'Motiva Sans';color:#9aa4b2;}",
       ".hubcap-src{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:9px 12px;margin-bottom:14px;font:500 12px/1.3 'Motiva Sans';color:#9aa4b2;}",
       ".hubcap-src .lbl{font-weight:700;color:#c7cdd6;}",
       ".hubcap-select.sm{padding:5px 8px;font-size:12px;}",
@@ -215,26 +212,6 @@
   function renderSourceRow(host) {
     call("HubcapGetConfig", {}).then(function (c) {
       host.innerHTML = "";
-      // loader selector — which tool reads the luas (folder differs)
-      var loaders = (c && c.loaders) || [];
-      var curLoader = (c && c.loader) || "steamidra";
-      if (loaders.length) {
-        var lrow = el('<div class="hubcap-src"><span class="lbl">Loader</span></div>');
-        var lsel = document.createElement("select"); lsel.className = "hubcap-select sm";
-        loaders.forEach(function (l) {
-          var o = new Option(l.name + (l.id === "steamidra" ? " (default)" : ""), l.id);
-          if (l.id === curLoader) o.selected = true;
-          lsel.appendChild(o);
-        });
-        lrow.appendChild(lsel); host.appendChild(lrow);
-        lsel.addEventListener("change", function () {
-          call("HubcapSetLoader", { loader: lsel.value }).then(function () {
-            toast("Loader: " + lsel.options[lsel.selectedIndex].text.replace(" (default)", ""));
-            var overlay = host.closest(".hubcap-overlay"); var appid = getAppId();
-            if (overlay && appid) refresh(appid, overlay);   // folder changed → re-check state
-          });
-        });
-      }
       var sources = (c && c.sources) || [];
       if (!sources.length) return;
       var main = (c && c.mainSource) || "hubcap";
@@ -354,23 +331,6 @@
         host.appendChild(card);
         renderVersionPicker(card.querySelector(".hc-ver"), appid, dp, overlay);
       }
-
-      // game-level update lock (OST pinApp) — stops the game updating at all
-      var pinned = st.pinned === true;
-      var pinBox = el('<div class="hubcap-pin"></div>');
-      pinBox.innerHTML = '<div class="pi"><span class="hubcap-badge ' + (pinned ? "frozen" : "live") + '">' +
-        (pinned ? "Pinned" : "Not pinned") + '</span><span class="pt">' +
-        (pinned ? "Updates are blocked for this game." : "Lock this game so Steam won\'t update it (keeps the installed version).") +
-        '</span></div>';
-      var pinBtn = el('<button class="hubcap-btn ' + (pinned ? "r" : "p") + '">' + (pinned ? "Unpin" : "Pin (block updates)") + '</button>');
-      pinBox.appendChild(pinBtn); host.appendChild(pinBox);
-      pinBtn.addEventListener("click", function () {
-        pinBtn.disabled = true;
-        call(pinned ? "HubcapUnpin" : "HubcapPin", { appid: appid }).then(function (r) {
-          if (r && r.success) { toast(r.message || (pinned ? "Unpinned" : "Pinned")); refresh(appid, overlay); }
-          else { toast((r && r.error) || "Failed", false); pinBtn.disabled = false; }
-        });
-      });
 
       var foot = el('<div style="display:flex;justify-content:flex-end;margin-top:6px;"><button class="hubcap-btn r" id="hc-remove">Remove install</button></div>');
       host.appendChild(foot);
