@@ -56,13 +56,14 @@ local function read_config()
     return (ok and type(d) == "table") and d or {}
 end
 
--- Lua download sources (same set LuaTools used). Hubcap needs the API key
--- (auth). The others are free/keyless. "{appid}" is substituted per request.
+-- Lua download sources. Hubcap needs the API key (auth); the others are
+-- free/keyless. "{appid}" is substituted per request. An unknown saved
+-- main_source (e.g. the retired TwentyTwo Cloud) falls back to Hubcap.
 local SOURCES = {
     { id = "hubcap",    name = "Hubcap",          auth = true  },  -- url from api_base
     { id = "ryuu",      name = "Ryuu",            auth = false, url = "http://167.235.229.108/{appid}" },
-    { id = "twentytwo", name = "TwentyTwo Cloud", auth = false, url = "https://api.twentytwocloud.com/download?appid={appid}" },
     { id = "sushi",     name = "Sushi",           auth = false, url = "https://raw.githubusercontent.com/sushi-dev55-alt/sushitools-games-repo-alt/refs/heads/main/{appid}.zip" },
+    { id = "revobd",    name = "Revo",            auth = false, url = "https://api.luagen.revobd.club/{appid}.zip" },
 }
 
 local function source_url(s, appid, cfg)
