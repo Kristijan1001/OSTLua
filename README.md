@@ -5,7 +5,7 @@
 
 ---
 
-> **⚠️ Installed games before? Re-download their lua.** Older builds installed games with the manifest pinned, which could silently block Steam updates. If a game isn't updating, **re-download its lua through OSTLua** (or open OSTLua and hit **Unpin**) — that clears the pin so it updates normally again.
+> **⚠️ Installed games before? Re-download their lua.** Older builds installed games with the manifest pinned, which could silently block Steam updates. If a game isn't updating, **re-download its lua through OSTLua** (or open OSTLua → **Load versions** → **Revert**) — that clears the pin so it updates normally again.
 
 ---
 
@@ -14,7 +14,6 @@
 - **One-click install**
 - **Quick Install**
 - **Freeze / downgrade**
-- **Pin (block updates)**
 - **Multiple download sources**
 
 ---
@@ -40,13 +39,13 @@ No config files to set up — the plugin creates everything on first run. Open t
 
 ---
 
-## Downgrade & Pin
+## Downgrade & Freeze
 
 Open a game's Steam store page and click the **OSTLua** button (top-right).
 
-**Downgrade / freeze a version** — open OSTLua → **Load versions** → pick the version you want → **Apply**. This pins the depot to that manifest (via `setManifestid`); the original is kept so **Revert** puts it back anytime.
+**Downgrade / freeze a version** — open OSTLua → **Load versions from SteamDB** → pick the version you want → **Apply**. This pins the depot to that manifest (via `setManifestid`); the original is kept so **Revert** puts it back anytime.
 
-**Pin (block updates)** — hit **Pin (block updates)** to lock the game at its currently installed version so Steam won't update it (adds a `pinApp` line). **Unpin** to allow updates again.
+> **🔑 Log in to SteamDB (through Steam) for full version history.** SteamDB only shows a short, recent slice of manifests to logged-out visitors. When OSTLua opens the SteamDB page, press **"Sign in through Steam"** on SteamDB first — once you're logged in it exposes the game's **full history of versions/updates**, so OSTLua can fetch far more versions to choose from. After signing in, hit **Load versions** again (or the reload ↻ button) to pull the complete list.
 
 Changes apply live — no restart needed.
 
