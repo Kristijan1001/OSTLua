@@ -1,7 +1,11 @@
 # OSTLua
-<img width="480" height="347" alt="image" src="https://github.com/user-attachments/assets/99a8c8d2-789c-49bf-bd4c-16c92cb4630c" />
 
-<img width="1061" height="1142" alt="image" src="https://github.com/user-attachments/assets/d710c679-d87b-4da5-827f-c2ddf21ed7f7" />
+https://github.com/user-attachments/assets/12b13717-3376-477b-a403-7eedd1f27cda
+
+
+<img width="1066" height="860" alt="steamwebhelper_kE02wileFk" src="https://github.com/user-attachments/assets/01781d90-524a-474d-917f-342395f4363e" />
+
+<img width="371" height="164" alt="steamwebhelper_JeBbUrheaa" src="https://github.com/user-attachments/assets/992fcf4d-6ede-4bdb-8ad5-8fc265253841" />
 
 ---
 
