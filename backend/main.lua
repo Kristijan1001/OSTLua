@@ -100,14 +100,20 @@ local function build_source_order(appid, cfg)
     return order
 end
 
+-- BetterSteamTools reads luas from <Steam>/config/stplug-in (see BST
+-- dllmain.cpp: "%s\\config\\stplug-in"). The old OpenSteamTool default was
+-- <Steam>/config/lua, so that stays in the candidate list for reads — installs
+-- go to whichever folder lua_dir_name points at (stplug-in by default).
+local DEFAULT_LUA_DIR = "stplug-in"
+
 local function lua_dir_candidates()
     local s = steam_dir()
     local cfg = read_config()
-    local name = cfg.lua_dir_name or "lua"
+    local name = cfg.lua_dir_name or DEFAULT_LUA_DIR
     return {
-        fs.join(s, "config", name),         -- primary (OST default: config/lua)
-        fs.join(s, "config", "lua"),
+        fs.join(s, "config", name),         -- primary (BST default: config/stplug-in)
         fs.join(s, "config", "stplug-in"),
+        fs.join(s, "config", "lua"),        -- legacy OpenSteamTool location
         fs.join(s, "config", "hubcap-lua"), -- legacy Hubcap installs
     }
 end
@@ -182,15 +188,35 @@ end
 
 -- ── webkit injection ─────────────────────────────────────────────────────────
 
+-- Millennium >= 3.4.0 loads a plugin's webkit script from a fixed path inside the
+-- plugin itself: <plugin>/.millennium/Dist/webkit.js (see plugin_manager.cc,
+-- plugin_webkit_path). The old route — copy into <steam>/steamui/webkit and
+-- register it with add_browser_js — stopped injecting after 3.4.0's CEF/loopback
+-- hook refactor, which is why the UI vanished.
+--
+-- We keep BOTH: Dist/webkit.js is what 3.4.0+ actually loads, and the steamui
+-- copy keeps 3.3.x working. Writing Dist/webkit.js here also self-heals it if the
+-- user updates public/ostlua.js by hand.
 local function copy_and_inject_webkit()
+    local src = fs.join(plugin_dir(), "public", "ostlua.js")
+    local content = fs.exists(src) and m_utils.read_file(src) or nil
+
+    -- 1) modern path (Millennium >= 3.4.0)
+    if content then
+        local dist = fs.join(plugin_dir(), ".millennium", "Dist")
+        if not fs.exists(dist) then pcall(fs.create_directories, dist) end
+        local wk = fs.join(dist, "webkit.js")
+        -- only rewrite when it actually differs, so we don't touch mtime every boot
+        if m_utils.read_file(wk) ~= content then
+            pcall(m_utils.write_file, wk, content)
+        end
+    end
+
+    -- 2) legacy path (Millennium <= 3.3.x) — harmless no-op on newer builds
     local s = steam_dir()
     local target = fs.join(s, "steamui", "webkit")
     if not fs.exists(target) then pcall(fs.create_directories, target) end
-    local src = fs.join(plugin_dir(), "public", "ostlua.js")
-    if fs.exists(src) then
-        local c = m_utils.read_file(src)
-        if c then m_utils.write_file(fs.join(target, "ostlua.js"), c) end
-    end
+    if content then pcall(m_utils.write_file, fs.join(target, "ostlua.js"), content) end
     pcall(millennium.add_browser_js, "webkit/ostlua.js")
 end
 
@@ -517,7 +543,7 @@ function HubcapSetApiKey(contentScriptQuery, payload)
         local cfg = read_config()
         cfg.api_key = key  -- empty string clears the saved key
         if not cfg.api_base then cfg.api_base = "https://hubcapmanifest.com/api/v1" end
-        if not cfg.lua_dir_name then cfg.lua_dir_name = "lua" end
+        if not cfg.lua_dir_name then cfg.lua_dir_name = DEFAULT_LUA_DIR end
         m_utils.write_file(fs.join(backend_dir(), "config.json"), cjson.encode(cfg))
         return { success = true, cleared = (key == "") }
     end)
@@ -561,6 +587,106 @@ function HubcapOpenUrl(contentScriptQuery, payload)
     return json_ok(res)
 end
 
+-- ── migration: OpenSteamTool config/lua -> BetterSteamTools config/stplug-in ─
+-- BST only reads <Steam>/config/stplug-in, so luas installed by older OSTLua
+-- builds (into config/lua) are invisible to it. We never move anything on our
+-- own — the frontend asks first, and HubcapMigrateRun only runs on a yes.
+
+local function migrate_flag_path() return fs.join(ensure_data_dir(), "migrated.json") end
+
+local function list_luas(dir)
+    local out = {}
+    if not fs.exists(dir) then return out end
+    local ok, entries = pcall(fs.list, dir)
+    if not ok or type(entries) ~= "table" then return out end
+    for _, e in ipairs(entries) do
+        local name = type(e) == "table" and e.name or tostring(e)
+        name = tostring(name):match("([^/\\]+)$") or tostring(name)
+        local is_file = (type(e) ~= "table") or (e.is_file ~= false)
+        if is_file and name:lower():match("%.lua$") then out[#out + 1] = name end
+    end
+    return out
+end
+
+-- What still needs moving: .lua files present in the old dir but NOT already in
+-- the new one (an existing file at the destination always wins — never clobber).
+local function migration_plan()
+    local s = steam_dir()
+    local cfg = read_config()
+    local dest_name = cfg.lua_dir_name or DEFAULT_LUA_DIR
+    local from = fs.join(s, "config", "lua")
+    local to   = fs.join(s, "config", dest_name)
+    if from == to then return { from = from, to = to, files = {}, conflicts = {} } end
+
+    local have = {}
+    for _, n in ipairs(list_luas(to)) do have[n:lower()] = true end
+
+    local files, conflicts = {}, {}
+    for _, n in ipairs(list_luas(from)) do
+        if have[n:lower()] then conflicts[#conflicts + 1] = n else files[#files + 1] = n end
+    end
+    return { from = from, to = to, files = files, conflicts = conflicts }
+end
+
+-- pending = how many luas are still stranded in the old folder.
+function HubcapMigrateStatus(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        local p = migration_plan()
+        local dismissed = fs.exists(migrate_flag_path())
+        return { success = true, pending = #p.files, conflicts = #p.conflicts,
+                 from = p.from, to = p.to, dismissed = dismissed }
+    end)
+    if not ok then return json_err(res) end
+    return json_ok(res)
+end
+
+-- Remember the user said "not now" so we stop asking on every boot.
+function HubcapMigrateDismiss(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        pcall(m_utils.write_file, migrate_flag_path(), cjson.encode({ dismissed = true }))
+        return { success = true }
+    end)
+    if not ok then return json_err(res) end
+    return json_ok(res)
+end
+
+function HubcapMigrateRun(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        local p = migration_plan()
+        if #p.files == 0 then
+            pcall(m_utils.write_file, migrate_flag_path(), cjson.encode({ dismissed = true }))
+            return { success = true, moved = 0, failed = 0, skipped = #p.conflicts }
+        end
+        if not fs.exists(p.to) then pcall(fs.create_directories, p.to) end
+
+        local moved, failed = 0, 0
+        for _, name in ipairs(p.files) do
+            local src, dst = fs.join(p.from, name), fs.join(p.to, name)
+            -- rename first (fast, same volume); fall back to copy+delete
+            local rok = pcall(fs.rename, src, dst)
+            if not rok or not fs.exists(dst) then
+                local content = m_utils.read_file(src)
+                if content and pcall(m_utils.write_file, dst, content) and fs.exists(dst) then
+                    pcall(fs.remove, src)
+                    rok = true
+                else
+                    rok = false
+                end
+            end
+            if rok then moved = moved + 1 else failed = failed + 1 end
+        end
+
+        log("migrate: moved " .. moved .. " lua(s) to " .. p.to ..
+            " (skipped " .. #p.conflicts .. ", failed " .. failed .. ")")
+        if failed == 0 then
+            pcall(m_utils.write_file, migrate_flag_path(), cjson.encode({ dismissed = true }))
+        end
+        return { success = true, moved = moved, failed = failed, skipped = #p.conflicts, to = p.to }
+    end)
+    if not ok then return json_err(res) end
+    return json_ok(res)
+end
+
 -- ── lifecycle ────────────────────────────────────────────────────────────────
 
 -- First run: write config.json with defaults so nobody has to create it by hand
@@ -568,7 +694,7 @@ end
 local function ensure_config()
     local p = fs.join(backend_dir(), "config.json")
     if fs.exists(p) then return end
-    local defaults = { lua_dir_name = "lua", api_base = "https://hubcapmanifest.com/api/v1",
+    local defaults = { lua_dir_name = DEFAULT_LUA_DIR, api_base = "https://hubcapmanifest.com/api/v1",
                        api_key = "", main_source = "hubcap", fallback = false }
     pcall(function() m_utils.write_file(p, cjson.encode(defaults)) end)
 end

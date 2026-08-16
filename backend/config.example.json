@@ -1,5 +1,5 @@
 {
-  "lua_dir_name": "lua",
+  "lua_dir_name": "stplug-in",
   "api_base": "https://hubcapmanifest.com/api/v1",
   "api_key": "",
   "main_source": "hubcap",

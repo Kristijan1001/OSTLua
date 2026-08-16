@@ -24,14 +24,12 @@ try {
     if (Test-Path $cfgPath) {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
     } else {
-        $cfg = [pscustomobject]@{ api_key = ""; api_base = "https://hubcapmanifest.com/api/v1"; loader = "steamidra" }
+        $cfg = [pscustomobject]@{ api_key = ""; api_base = "https://hubcapmanifest.com/api/v1"; lua_dir_name = "stplug-in" }
     }
-    if (-not $cfg.api_base) { $cfg | Add-Member -NotePropertyName api_base -NotePropertyValue "https://hubcapmanifest.com/api/v1" -Force }
-    # Folder is chosen by the selected loader: steamidra -> stplug-in, ost -> lua
-    $loader   = if ($cfg.loader -eq "ost") { "ost" } else { "steamidra" }
-    $luaDirNm = if ($loader -eq "ost") { "lua" } else { "stplug-in" }
+    if (-not $cfg.lua_dir_name) { $cfg | Add-Member -NotePropertyName lua_dir_name -NotePropertyValue "stplug-in" -Force }
+    if (-not $cfg.api_base)     { $cfg | Add-Member -NotePropertyName api_base -NotePropertyValue "https://hubcapmanifest.com/api/v1" -Force }
     $apiKey  = $cfg.api_key
-    $luaDir  = Join-Path $SteamPath ("config\" + $luaDirNm)
+    $luaDir  = Join-Path $SteamPath ("config\" + $cfg.lua_dir_name)
     $depotCache = Join-Path $SteamPath "depotcache"
     New-Item -ItemType Directory -Force -Path $luaDir     | Out-Null
     New-Item -ItemType Directory -Force -Path $depotCache | Out-Null
