@@ -140,6 +140,8 @@
       ".hubcap-install{display:flex;flex-direction:column;align-items:center;gap:14px;padding:20px 10px 8px;text-align:center;}",
       ".hubcap-install .hc-shield{width:50px;height:50px;opacity:.9;}.hubcap-install .msg{font:500 13px/1.55 'Motiva Sans';color:#aab2bf;max-width:430px;}",
       ".hubcap-depot{border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px 16px;margin-bottom:14px;background:rgba(255,255,255,.02);}",
+      ".hubcap-warn{margin-top:10px;padding:10px 12px;border-radius:10px;background:rgba(224,176,85,.09);border:1px solid rgba(224,176,85,.35);font:400 12px/1.5 'Motiva Sans';color:#e6d3ac;}",
+      ".hubcap-warn b{color:#f0c674;}",
       ".hubcap-migrate{position:fixed;right:20px;bottom:20px;z-index:99999;width:390px;max-width:calc(100vw - 40px);background:#1b2129;border:1px solid rgba(160,107,255,.45);border-radius:14px;padding:16px 18px;box-shadow:0 14px 40px rgba(0,0,0,.6);font:400 13px/1.55 'Motiva Sans',Arial,sans-serif;color:#c7cdd6;}",
       ".hubcap-migrate .mt{font:700 14px/1.3 'Motiva Sans';color:#fff;margin-bottom:7px;}",
       ".hubcap-migrate .mm{color:#9aa4b2;font-size:12.5px;}",
@@ -348,9 +350,53 @@
     });
   }
 
-  function applyManifest(appid, dp, id, overlay) {
-    call("HubcapFreeze", { appid: appid, depotid: dp.depot, manifestid: id }).then(function (r) {
-      if (r && r.success) toast(r.message || "Applied"); else toast((r && r.error) || "Failed", false);
+  // `date` is the build date of the chosen version. The backend uses it to pin
+  // every OTHER depot to the manifest it had at that build, so the whole game
+  // lands on one build instead of base-depot-old + other-depot-latest.
+
+  // Depots other than the main one need their own SteamDB history before they
+  // can be pinned to a chosen build. Open each missing depot's manifests page in
+  // turn; the scraper at the top of this file saves the list and closes the tab.
+  function loadDepotVersions(depots, statusEl, done) {
+    var queue = depots.slice(), okCount = 0;
+    function next() {
+      if (!queue.length) { if (done) done(okCount); return; }
+      var d = queue.shift();
+      if (statusEl) statusEl.textContent = "Loading versions for depot " + d + " (" + (depots.length - queue.length) + "/" + depots.length + ")…";
+      var w = null;
+      try { w = window.open("https://steamdb.info/depot/" + d + "/manifests/", "_blank"); }
+      catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + d + "/manifests/" }); }
+      var tries = 0;
+      var iv = startPoll(function () {
+        tries++;
+        call("HubcapGetManifests", { depot: d }).then(function (r) {
+          var got = r && r.manifests && r.manifests.length;
+          if (got) {
+            clearInterval(iv); okCount++;
+            try { if (w) w.close(); } catch (e) {}
+            next();
+          } else if (tries > 45) {           // ~31s, enough for Cloudflare
+            clearInterval(iv);
+            try { if (w) w.close(); } catch (e) {}
+            next();
+          }
+        });
+      }, 700);
+    }
+    next();
+  }
+
+  function applyManifest(appid, dp, id, overlay, date) {
+    call("HubcapFreeze", { appid: appid, depotid: dp.depot, manifestid: id, date: date || "" }).then(function (r) {
+      if (r && r.success) {
+        var n = (r.applied || []).length;
+        var un = r.unresolved || [];
+        toast(n > 1 ? ("Pinned " + n + " depots to this build") : (r.message || "Applied"));
+        if (un.length) {
+          toast("No version history for depot" + (un.length > 1 ? "s " : " ") + un.join(", ") +
+                " — load their versions or they stay on latest", false);
+        }
+      } else toast((r && r.error) || "Failed", false);
       refresh(appid, overlay);
     });
   }
@@ -376,7 +422,38 @@
         bar.appendChild(sel); bar.appendChild(reB); bar.appendChild(applyB);
         if (dp.frozen) { var rv = el('<button class="hubcap-btn r">Revert</button>'); bar.appendChild(rv); rv.onclick = function () { doRevert(appid, dp, overlay); }; }
         host.appendChild(bar);
-        applyB.onclick = function () { if (!sel.value) { toast("Pick a version", false); return; } applyManifest(appid, dp, sel.value, overlay); };
+
+        // other depots with no cached history -> they'd stay on latest
+        call("HubcapStatus", { appid: appid }).then(function (st2) {
+          var missing = [];
+          ((st2 && st2.depots) || []).forEach(function (d) {
+            if (!d.isMain && !d.hasVersions) missing.push(d.depot);
+          });
+          if (!missing.length) return;
+          var warn = el('<div class="hubcap-warn"></div>');
+          warn.innerHTML = '<b>' + missing.length + ' other depot' + (missing.length > 1 ? 's have' : ' has') +
+            ' no version history yet.</b> Without it ' + (missing.length > 1 ? 'they stay' : 'it stays') +
+            ' on the newest build, which gives you a half-downgraded game.';
+          var lb = el('<button class="hubcap-btn g" style="margin-top:8px">Load versions for ' + missing.length + ' depot' + (missing.length > 1 ? 's' : '') + '</button>');
+          var stat = document.createElement("div"); stat.className = "hubcap-note2"; stat.style.marginTop = "6px";
+          warn.appendChild(lb); warn.appendChild(stat);
+          host.appendChild(warn);
+          lb.onclick = function () {
+            lb.disabled = true;
+            loadDepotVersions(missing, stat, function (n) {
+              stat.textContent = "Loaded " + n + "/" + missing.length + ".";
+              toast(n ? ("Loaded versions for " + n + " depot(s)") : "Couldn't read SteamDB", !!n);
+              refresh(appid, overlay);
+            });
+          };
+        });
+
+        applyB.onclick = function () {
+          if (!sel.value) { toast("Pick a version", false); return; }
+          var hit = null;
+          for (var i = 0; i < list.length; i++) if (String(list[i].id) === String(sel.value)) { hit = list[i]; break; }
+          applyManifest(appid, dp, sel.value, overlay, hit && hit.date);
+        };
         reB.onclick = function () { call("HubcapSaveManifests", { depot: dp.depot, manifests: [] }).then(function () { toast("Cleared — reload from SteamDB"); showSources(host, appid, dp, overlay); }); };
       } else {
         showSources(host, appid, dp, overlay);

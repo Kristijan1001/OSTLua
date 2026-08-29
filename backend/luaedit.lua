@@ -171,4 +171,23 @@ function M.revert(content, depot)
 end
 
 
+-- Every depot this lua controls, i.e. that carries a setManifestid line in any
+-- state (active, pinned, or commented out by install). Order is file order.
+--
+-- Pinning only the "main" depot is what produced half-downgraded installs: the
+-- other content depots stayed commented, and a commented setManifestid means
+-- Steam takes the LATEST manifest for that depot.
+function M.all_depots(content)
+    local seen, out = {}, {}
+    for _, line in ipairs(split_lines(content)) do
+        local d = parse_line(line)
+        if d and not seen[d] then
+            seen[d] = true
+            out[#out + 1] = d
+        end
+    end
+    return out
+end
+
+
 return M

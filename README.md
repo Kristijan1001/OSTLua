@@ -62,6 +62,12 @@ Open a game's Steam store page and click the **OSTLua** button (top-right).
 
 > **🔑 Log in to SteamDB (through Steam) for full version history.** SteamDB only shows a short, recent slice of manifests to logged-out visitors. When OSTLua opens the SteamDB page, press **"Sign in through Steam"** on SteamDB first — once you're logged in it exposes the game's **full history of versions/updates**, so OSTLua can fetch far more versions to choose from. After signing in, hit **Load versions** again (or the reload ↻ button) to pull the complete list.
 
+**Every depot gets pinned, not just one.** A game's content is usually split across several depots. Pinning only the main one leaves the rest on the newest build, which gives you a half-downgraded game that looks like "it downloaded the latest version anyway". OSTLua resolves *every* depot to the manifest it had at the build you picked, so the whole game lands on one version.
+
+Depots other than the main one need their own SteamDB history first. If any are missing, the picker says so and offers **Load versions for N depots** — do that once and Apply pins them all.
+
+After applying, restart Steam and use **Verify integrity of game files** if Steam reports "no changes" — it sometimes relabels the manifest without actually fetching the older files.
+
 Changes apply live — no restart needed.
 
 ---

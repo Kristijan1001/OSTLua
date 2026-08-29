@@ -234,7 +234,20 @@ function HubcapStatus(contentScriptQuery, payload)
         local content = m_utils.read_file(glua) or ""
         local md = luaedit.main_depot(content, appid)
         local depot = md and luaedit.depot_status(content, md) or nil
-        return { success = true, installed = true, luaPath = glua, mainDepot = md, depot = depot }
+
+        -- Every depot the lua controls, and whether we have a cached SteamDB
+        -- version list for it. Without that list a depot can't be pinned to a
+        -- chosen build and would silently stay on latest.
+        local depots = {}
+        for _, d in ipairs(luaedit.all_depots(content)) do
+            local st = luaedit.depot_status(content, d)
+            st.hasVersions = fs.exists(fs.join(ensure_data_dir(), "manifests_" .. d .. ".json"))
+            st.isMain = (d == md)
+            depots[#depots + 1] = st
+        end
+
+        return { success = true, installed = true, luaPath = glua, mainDepot = md,
+                 depot = depot, depots = depots }
     end)
     if not ok then return json_err(res) end
     return json_ok(res)
@@ -404,6 +417,56 @@ function HubcapRemove(contentScriptQuery, payload)
     return json_ok(res)
 end
 
+-- ── build-coherent pinning ───────────────────────────────────────────────────
+-- A game's content is split across several depots. Pinning only the "main" one
+-- left the rest commented out, and a commented setManifestid means Steam takes
+-- the LATEST manifest for that depot - so you got a half-downgraded install
+-- (base depot on the old build, another content depot still on the newest).
+--
+-- The manifest a depot had at build date D is simply its newest manifest dated
+-- <= D: depots that did not change in that build keep their previous manifest.
+-- We resolve every depot that way from the cached SteamDB lists.
+
+local MONTHS = {
+    january = 1, february = 2, march = 3, april = 4, may = 5, june = 6,
+    july = 7, august = 8, september = 9, october = 10, november = 11, december = 12,
+    jan = 1, feb = 2, mar = 3, apr = 4, jun = 6, jul = 7, aug = 8, sep = 9,
+    sept = 9, oct = 10, nov = 11, dec = 12,
+}
+
+-- "13 March 2026" -> 20260313 (sortable). nil when unparseable.
+local function date_key(str)
+    if type(str) ~= "string" then return nil end
+    local d, mon, y = str:match("(%d+)%s+([A-Za-z]+)%s+(%d%d%d%d)")
+    if not d then return nil end
+    local m = MONTHS[mon:lower()]
+    if not m then return nil end
+    return tonumber(y) * 10000 + m * 100 + tonumber(d)
+end
+
+-- cached SteamDB list for one depot -> { {id=, date=} , ... }
+local function cached_manifests(depot)
+    local raw = m_utils.read_file(manifests_path(depot))
+    if not raw or raw == "" then return {} end
+    raw = raw:gsub("^98791", "")
+    local ok, d = pcall(cjson.decode, raw)
+    if not ok or type(d) ~= "table" or type(d.manifests) ~= "table" then return {} end
+    return d.manifests
+end
+
+-- newest manifest for `depot` dated on or before `key`
+local function manifest_at(depot, key)
+    local best, best_key = nil, nil
+    for _, e in ipairs(cached_manifests(depot)) do
+        local k = date_key(e.date)
+        local id = e.id and tostring(e.id) or nil
+        if k and id and k <= key and (best_key == nil or k > best_key) then
+            best, best_key = id, k
+        end
+    end
+    return best
+end
+
 -- freeze / downgrade a depot to a chosen manifest id
 function HubcapFreeze(contentScriptQuery, payload)
     local ok, res = pcall(function()
@@ -416,10 +479,38 @@ function HubcapFreeze(contentScriptQuery, payload)
         if not glua then return { success = false, error = "game lua not installed" } end
         local content = m_utils.read_file(glua)
         if not content then return { success = false, error = "failed to read lua" } end
+        -- 1) the depot the user picked a version for
         local newc, changed, msg = luaedit.freeze(content, depot, target)
+        local applied, unresolved = { { depot = depot, manifest = target } }, {}
+
+        -- 2) every other depot -> its manifest as of the same build date, so the
+        --    whole game lands on one coherent build instead of a mix.
+        local key = date_key(tostring(p.date or ""))
+        if key then
+            for _, d in ipairs(luaedit.all_depots(newc)) do
+                if d ~= depot then
+                    local m = manifest_at(d, key)
+                    if m then
+                        local c2, ch2 = luaedit.freeze(newc, d, m)
+                        if ch2 then newc, changed = c2, true end
+                        applied[#applied + 1] = { depot = d, manifest = m }
+                    else
+                        unresolved[#unresolved + 1] = d
+                    end
+                end
+            end
+        else
+            for _, d in ipairs(luaedit.all_depots(newc)) do
+                if d ~= depot then unresolved[#unresolved + 1] = d end
+            end
+        end
+
         if changed then m_utils.write_file(glua, newc) end
-        log("freeze appid=" .. appid .. " depot=" .. depot .. " -> " .. target .. " (" .. tostring(msg) .. ")")
-        return { success = true, changed = changed, message = msg, depot = depot, manifest = target }
+        log("freeze appid=" .. appid .. " depot=" .. depot .. " -> " .. target ..
+            " (" .. tostring(msg) .. ") | pinned " .. #applied .. " depot(s), " ..
+            #unresolved .. " unresolved")
+        return { success = true, changed = changed, message = msg, depot = depot,
+                 manifest = target, applied = applied, unresolved = unresolved }
     end)
     if not ok then return json_err(res) end
     return json_ok(res)
@@ -435,9 +526,21 @@ function HubcapRevert(contentScriptQuery, payload)
         if not glua then return { success = false, error = "game lua not installed" } end
         local content = m_utils.read_file(glua)
         if not content then return { success = false, error = "failed to read lua" } end
-        local newc, changed, msg = luaedit.revert(content, depot)
+        -- Revert every depot: freeze now pins all of them, so clearing only the
+        -- main one would leave the rest stuck on an old build.
+        local newc, changed, msg = content, false, "Nothing to revert"
+        local targets = (depot ~= "") and { depot } or luaedit.all_depots(content)
+        if depot ~= "" then
+            for _, d in ipairs(luaedit.all_depots(content)) do
+                if d ~= depot then targets[#targets + 1] = d end
+            end
+        end
+        for _, d in ipairs(targets) do
+            local c2, ch2, m2 = luaedit.revert(newc, d)
+            if ch2 then newc, changed, msg = c2, true, m2 end
+        end
         if changed then m_utils.write_file(glua, newc) end
-        log("revert appid=" .. appid .. " depot=" .. depot .. " (" .. tostring(msg) .. ")")
+        log("revert appid=" .. appid .. " depots=" .. #targets .. " (" .. tostring(msg) .. ")")
         return { success = true, changed = changed, message = msg, depot = depot }
     end)
     if not ok then return json_err(res) end

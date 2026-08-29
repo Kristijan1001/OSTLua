@@ -3,7 +3,7 @@
   "name": "ostlua",
   "common_name": "OSTLua",
   "description": "Install game manifests and freeze / downgrade versions from the store page.",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "backendType": "lua",
   "include": [
     "public"
