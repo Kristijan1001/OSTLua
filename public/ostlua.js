@@ -354,65 +354,49 @@
   // every OTHER depot to the manifest it had at that build, so the whole game
   // lands on one build instead of base-depot-old + other-depot-latest.
 
-  // Depots other than the main one need their own SteamDB history before they
-  // can be pinned to a chosen build.
+  // Load one depot's SteamDB version history.
   //
-  // This CANNOT use script injection: Millennium 3.4.x only intercepts Steam
-  // domains (steamloopback.host + the steam TLDs), so our scraper never runs on
-  // steamdb.info any more. We use the same clipboard route the main depot uses -
-  // open the page, let it settle, then have the helper focus that window, select
-  // all, copy, and hand the text back.
-  function loadDepotVersions(depots, statusEl, done) {
-    var queue = depots.slice(), okCount = 0;
-    function say(msg) { if (statusEl) statusEl.textContent = msg; }
+  // Script injection can't help here: Millennium 3.4.x only intercepts
+  // steamloopback.host and the steam TLDs, so nothing of ours runs on
+  // steamdb.info. We open the page and let the helper copy it, same as the main
+  // depot. Deliberately ONE depot per click - chaining tabs automatically was
+  // unreliable (Steam's browser would only honour the first window.open).
+  function loadOneDepot(depot, statusEl, done) {
+    function say(m) { if (statusEl) statusEl.textContent = m; }
+    say("Opening SteamDB for depot " + depot + "…");
+    var w = null;
+    try { w = window.open("https://steamdb.info/depot/" + depot + "/manifests/", "_blank"); }
+    catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + depot + "/manifests/" }); }
 
-    function next() {
-      if (!queue.length) { if (done) done(okCount); return; }
-      var d = queue.shift();
-      var idx = depots.length - queue.length;
-      var tag = "Depot " + d + " (" + idx + "/" + depots.length + ")";
-
-      say(tag + ": opening SteamDB...");
-      var w = null;
-      try { w = window.open("https://steamdb.info/depot/" + d + "/manifests/", "_blank"); }
-      catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + d + "/manifests/" }); }
-
-      function finish(gotAny) {
-        if (gotAny) okCount++;
-        try { if (w) w.close(); } catch (e) {}
-        setTimeout(next, 300);
-      }
-
-      // give the page (and any Cloudflare check) time before copying
-      setTimeout(function () {
-        say(tag + ": copying page...");
-        call("HubcapGrabClipboard", { depot: d, auto: true }).then(function () {
-          var tries = 0;
-          var iv = startPoll(function () {
-            tries++;
-            call("HubcapGrabResult", { depot: d }).then(function (r) {
-              if (r && r.state === "done") {
-                clearInterval(iv);
-                var parsed = parseManifestText(r.text || "");
-                if (parsed.length) {
-                  say(tag + ": found " + parsed.length + " versions");
-                  call("HubcapSaveManifests", { depot: d, manifests: parsed })
-                    .then(function () { finish(true); });
-                } else {
-                  say(tag + ": no versions found");
-                  finish(false);
-                }
-              } else if (tries > 40) {
-                clearInterval(iv);
-                say(tag + ": timed out");
-                finish(false);
+    setTimeout(function () {
+      say("Copying depot " + depot + "…");
+      call("HubcapGrabClipboard", { depot: depot, auto: true }).then(function () {
+        var tries = 0;
+        var iv = startPoll(function () {
+          tries++;
+          call("HubcapGrabResult", { depot: depot }).then(function (r) {
+            if (r && r.state === "done") {
+              clearInterval(iv);
+              var parsed = parseManifestText(r.text || "");
+              if (parsed.length) {
+                call("HubcapSaveManifests", { depot: depot, manifests: parsed }).then(function () {
+                  say("Depot " + depot + ": " + parsed.length + " versions saved.");
+                  try { if (w) w.close(); } catch (e) {}
+                  if (done) done(true, parsed.length);
+                });
+              } else {
+                say("Depot " + depot + ": nothing copied — open it yourself, Ctrl+A then Ctrl+C, and hit Grab.");
+                if (done) done(false, 0);
               }
-            });
-          }, 400);
-        });
-      }, 3000);
-    }
-    next();
+            } else if (tries > 45) {
+              clearInterval(iv);
+              say("Depot " + depot + ": timed out reading the page.");
+              if (done) done(false, 0);
+            }
+          });
+        }, 400);
+      });
+    }, 3000);
   }
 
   function applyManifest(appid, dp, id, overlay, date) {
@@ -452,7 +436,9 @@
         if (dp.frozen) { var rv = el('<button class="hubcap-btn r">Revert</button>'); bar.appendChild(rv); rv.onclick = function () { doRevert(appid, dp, overlay); }; }
         host.appendChild(bar);
 
-        // other depots with no cached history -> they'd stay on latest
+        // Other depots with no cached history. They can't be pinned to the
+        // chosen build, so they'd stay on the newest one — which is what makes a
+        // "downgrade" come out half-old, half-new.
         call("HubcapStatus", { appid: appid }).then(function (st2) {
           var missing = [];
           ((st2 && st2.depots) || []).forEach(function (d) {
@@ -461,20 +447,26 @@
           if (!missing.length) return;
           var warn = el('<div class="hubcap-warn"></div>');
           warn.innerHTML = '<b>' + missing.length + ' other depot' + (missing.length > 1 ? 's have' : ' has') +
-            ' no version history yet.</b> Without it ' + (missing.length > 1 ? 'they stay' : 'it stays') +
-            ' on the newest build, which gives you a half-downgraded game.';
-          var lb = el('<button class="hubcap-btn g" style="margin-top:8px">Load versions for ' + missing.length + ' depot' + (missing.length > 1 ? 's' : '') + '</button>');
-          var stat = document.createElement("div"); stat.className = "hubcap-note2"; stat.style.marginTop = "6px";
-          warn.appendChild(lb); warn.appendChild(stat);
+            ' no version history.</b> The game files are split across several depots — any depot ' +
+            'left without history stays on the newest build, so the game ends up part old, part new. ' +
+            'Load them one at a time:';
+          var stat = document.createElement("div"); stat.className = "hubcap-note2"; stat.style.marginTop = "8px";
+          missing.forEach(function (d) {
+            var row = el('<div class="hubcap-in" style="margin-top:6px"></div>');
+            var lbl = document.createElement("span");
+            lbl.className = "hubcap-note2"; lbl.style.flex = "1"; lbl.textContent = "Depot " + d;
+            var b = el('<button class="hubcap-btn g">Load versions</button>');
+            row.appendChild(lbl); row.appendChild(b); warn.appendChild(row);
+            b.onclick = function () {
+              b.disabled = true;
+              loadOneDepot(d, stat, function (okk) {
+                if (okk) { toast("Depot " + d + " loaded"); refresh(appid, overlay); }
+                else { b.disabled = false; toast("Couldn't read depot " + d, false); }
+              });
+            };
+          });
+          warn.appendChild(stat);
           host.appendChild(warn);
-          lb.onclick = function () {
-            lb.disabled = true;
-            loadDepotVersions(missing, stat, function (n) {
-              stat.textContent = "Loaded " + n + "/" + missing.length + ".";
-              toast(n ? ("Loaded versions for " + n + " depot(s)") : "Couldn't read SteamDB", !!n);
-              refresh(appid, overlay);
-            });
-          };
         });
 
         applyB.onclick = function () {
