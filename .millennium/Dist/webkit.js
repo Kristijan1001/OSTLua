@@ -355,33 +355,62 @@
   // lands on one build instead of base-depot-old + other-depot-latest.
 
   // Depots other than the main one need their own SteamDB history before they
-  // can be pinned to a chosen build. Open each missing depot's manifests page in
-  // turn; the scraper at the top of this file saves the list and closes the tab.
+  // can be pinned to a chosen build.
+  //
+  // This CANNOT use script injection: Millennium 3.4.x only intercepts Steam
+  // domains (steamloopback.host + the steam TLDs), so our scraper never runs on
+  // steamdb.info any more. We use the same clipboard route the main depot uses -
+  // open the page, let it settle, then have the helper focus that window, select
+  // all, copy, and hand the text back.
   function loadDepotVersions(depots, statusEl, done) {
     var queue = depots.slice(), okCount = 0;
+    function say(msg) { if (statusEl) statusEl.textContent = msg; }
+
     function next() {
       if (!queue.length) { if (done) done(okCount); return; }
       var d = queue.shift();
-      if (statusEl) statusEl.textContent = "Loading versions for depot " + d + " (" + (depots.length - queue.length) + "/" + depots.length + ")…";
+      var idx = depots.length - queue.length;
+      var tag = "Depot " + d + " (" + idx + "/" + depots.length + ")";
+
+      say(tag + ": opening SteamDB...");
       var w = null;
       try { w = window.open("https://steamdb.info/depot/" + d + "/manifests/", "_blank"); }
       catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + d + "/manifests/" }); }
-      var tries = 0;
-      var iv = startPoll(function () {
-        tries++;
-        call("HubcapGetManifests", { depot: d }).then(function (r) {
-          var got = r && r.manifests && r.manifests.length;
-          if (got) {
-            clearInterval(iv); okCount++;
-            try { if (w) w.close(); } catch (e) {}
-            next();
-          } else if (tries > 45) {           // ~31s, enough for Cloudflare
-            clearInterval(iv);
-            try { if (w) w.close(); } catch (e) {}
-            next();
-          }
+
+      function finish(gotAny) {
+        if (gotAny) okCount++;
+        try { if (w) w.close(); } catch (e) {}
+        setTimeout(next, 300);
+      }
+
+      // give the page (and any Cloudflare check) time before copying
+      setTimeout(function () {
+        say(tag + ": copying page...");
+        call("HubcapGrabClipboard", { depot: d, auto: true }).then(function () {
+          var tries = 0;
+          var iv = startPoll(function () {
+            tries++;
+            call("HubcapGrabResult", { depot: d }).then(function (r) {
+              if (r && r.state === "done") {
+                clearInterval(iv);
+                var parsed = parseManifestText(r.text || "");
+                if (parsed.length) {
+                  say(tag + ": found " + parsed.length + " versions");
+                  call("HubcapSaveManifests", { depot: d, manifests: parsed })
+                    .then(function () { finish(true); });
+                } else {
+                  say(tag + ": no versions found");
+                  finish(false);
+                }
+              } else if (tries > 40) {
+                clearInterval(iv);
+                say(tag + ": timed out");
+                finish(false);
+              }
+            });
+          }, 400);
         });
-      }, 700);
+      }, 3000);
     }
     next();
   }
@@ -511,12 +540,15 @@
     autoB.onclick = function () {
       toast("Opening SteamDB…");
       var w = openDb();
-      status.textContent = "Copying versions from SteamDB…";
+      status.textContent = "Opening SteamDB, waiting for the page…";
+      // A freshly opened SteamDB tab needs time to render (and can show a
+      // Cloudflare check first). 400ms copied an empty page more often than not.
       setTimeout(function () {
+        status.textContent = "Copying versions from SteamDB…";
         call("HubcapGrabClipboard", { depot: dp.depot, auto: true }).then(function () {
           pollGrab(function () { try { if (w) w.close(); } catch (e) {} });   // backup close
         });
-      }, 400);
+      }, 3000);
     };
     openB.onclick = openDb;
     grabB.onclick = function () {
