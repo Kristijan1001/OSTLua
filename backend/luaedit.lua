@@ -190,4 +190,19 @@ function M.all_depots(content)
 end
 
 
+-- Any manifest recorded for a depot, preferring the active/pinned line and
+-- falling back to a commented one. Used for depots that did NOT change in the
+-- chosen build: their manifest is whatever the lua already carries, and pinning
+-- that explicitly stops them floating to latest.
+function M.any_manifest(content, depot)
+    depot = tostring(depot)
+    local lines = split_lines(content)
+    local active_i, pin_i, orig_i, commented_i = locate(lines, depot)
+    local idx = pin_i or active_i or commented_i or orig_i
+    if not idx then return nil end
+    local _, m = parse_line(lines[idx])
+    return m
+end
+
+
 return M

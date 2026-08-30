@@ -173,7 +173,8 @@ local function sweep_data_dir()
 
         if transient then
             drop_file(path); removed = removed + 1
-        elseif is_file and name:match("^manifests_%d+%.json$") and now > 0 then
+        elseif is_file and (name:match("^manifests_%d+%.json$") or
+                            name:match("^builds_%d+%.json$")) and now > 0 then
             local tok, mtime = pcall(fs.last_write_time, path)
             mtime = tonumber(mtime)
             -- only expire when the timestamp looks like sane epoch seconds
@@ -246,8 +247,9 @@ function HubcapStatus(contentScriptQuery, payload)
             depots[#depots + 1] = st
         end
 
+        local bid, bdate = content:match("%-%- %[HUBCAP%-BUILD%]%s*(%S+)%s*|%s*([^\n]*)")
         return { success = true, installed = true, luaPath = glua, mainDepot = md,
-                 depot = depot, depots = depots }
+                 depot = depot, depots = depots, build = bid, buildDate = bdate }
     end)
     if not ok then return json_err(res) end
     return json_ok(res)
@@ -286,6 +288,47 @@ function HubcapGetManifests(contentScriptQuery, payload)
         local dok, dd = pcall(cjson.decode, rc)
         if not dok or type(dd) ~= "table" then return { success = true, manifests = {} } end
         return { success = true, manifests = dd.manifests or {} }
+    end)
+    if not ok then return json_err(res) end
+    return json_ok(res)
+end
+
+
+-- ── build list cache (per app) ───────────────────────────────────────────────
+-- SteamDB's app patchnotes page lists every build: date + BuildID. Picking a
+-- BUILD rather than a per-depot manifest is what lets us pin all depots
+-- coherently from a single page, and avoids a dropdown with 400 entries.
+local function builds_path(appid)
+    return fs.join(ensure_data_dir(), "builds_" .. tostring(appid) .. ".json")
+end
+
+function HubcapSaveBuilds(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        local p = parse_payload(payload)
+        local appid = tostring(p.appid or "")
+        if appid == "" then return { success = false, error = "no appid" } end
+        local list = p.builds
+        if type(list) == "string" then local dok, dd = pcall(cjson.decode, list); if dok then list = dd end end
+        if type(list) ~= "table" then list = {} end
+        m_utils.write_file(builds_path(appid), cjson.encode({ appid = appid, builds = list }))
+        return { success = true, count = #list }
+    end)
+    if not ok then return json_err(res) end
+    return json_ok(res)
+end
+
+function HubcapGetBuilds(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        local p = parse_payload(payload)
+        local appid = tostring(p.appid or "")
+        local pth = builds_path(appid)
+        if not fs.exists(pth) then return { success = true, builds = {} } end
+        local rc = m_utils.read_file(pth)
+        if not rc or rc == "" then return { success = true, builds = {} } end
+        rc = rc:gsub("^98791", "")
+        local dok, dd = pcall(cjson.decode, rc)
+        if not dok or type(dd) ~= "table" then return { success = true, builds = {} } end
+        return { success = true, builds = dd.builds or {} }
     end)
     if not ok then return json_err(res) end
     return json_ok(res)
@@ -516,6 +559,102 @@ function HubcapFreeze(contentScriptQuery, payload)
     return json_ok(res)
 end
 
+-- Pin an explicit depot -> manifest set, as read off a SteamDB build page.
+-- Depots in the lua that the build page did not list simply did not change in
+-- that build, so they keep the manifest the lua already carries - pinned
+-- explicitly, otherwise a commented setManifestid floats them to latest and you
+-- get the half-old/half-new install again. Depots on the page that the lua does
+-- not have (blacklisted ones) are ignored.
+function HubcapFreezePins(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        local p = parse_payload(payload)
+        local appid = tostring(p.appid or "")
+        local pins = p.pins
+        if type(pins) == "string" then local dok, dd = pcall(cjson.decode, pins); if dok then pins = dd end end
+        if type(pins) ~= "table" then return { success = false, error = "no pins" } end
+
+        local glua = find_game_lua(appid)
+        if not glua then return { success = false, error = "game lua not installed" } end
+        local content = m_utils.read_file(glua)
+        if not content then return { success = false, error = "failed to read lua" } end
+
+        local known = {}
+        for _, d in ipairs(luaedit.all_depots(content)) do known[d] = true end
+
+        -- Sanity: the game's main depot must be among what we read off the build
+        -- page. If it is not, the page was not read properly (wrong tab, page not
+        -- finished loading) and "carrying" the rest would pin every other depot
+        -- to its LATEST manifest - which is exactly the half-old/half-new install
+        -- this is supposed to prevent. Write nothing in that case.
+        local md = luaedit.main_depot(content, appid)
+        local saw_main = false
+        for _, pin in ipairs(pins) do
+            if tostring(pin.depot or "") == tostring(md or "") then saw_main = true end
+        end
+        if md and not saw_main then
+            log("freeze-build appid=" .. appid .. " build=" .. tostring(p.build or "?") ..
+                " ABORT: main depot " .. tostring(md) .. " missing from the build page (" ..
+                #pins .. " depot(s) read)")
+            return { success = false, incomplete = true, read = #pins, mainDepot = md,
+                     error = "Couldn't read build " .. tostring(p.build or "?") ..
+                             " properly - the main depot wasn't in it. Nothing was changed; try Apply again." }
+        end
+
+
+        local newc, changed = content, false
+        local applied, skipped, carried = {}, {}, {}
+
+        local wanted = {}
+        for _, pin in ipairs(pins) do
+            local d = tostring(pin.depot or "")
+            local m = tostring(pin.manifest or "")
+            if d ~= "" and m ~= "" then
+                if known[d] then
+                    wanted[d] = true
+                    local c2, ch2 = luaedit.freeze(newc, d, m)
+                    if ch2 then newc, changed = c2, true end
+                    applied[#applied + 1] = { depot = d, manifest = m }
+                else
+                    skipped[#skipped + 1] = d   -- not in this lua (blacklisted depot)
+                end
+            end
+        end
+
+        -- depots untouched by this build: pin them to what the lua already has
+        for _, d in ipairs(luaedit.all_depots(newc)) do
+            if not wanted[d] then
+                local m = luaedit.any_manifest(newc, d)
+                if m then
+                    local c2, ch2 = luaedit.freeze(newc, d, m)
+                    if ch2 then newc, changed = c2, true end
+                    carried[#carried + 1] = { depot = d, manifest = m }
+                end
+            end
+        end
+
+        -- Record which build these pins came from, so the UI can say more than a
+        -- bare manifest id. Kept as a comment in the lua itself so it survives
+        -- restarts and is obvious to anyone reading the file.
+        if changed then
+            local stamp = "-- [HUBCAP-BUILD] " .. tostring(p.build or "?") ..
+                          " | " .. tostring(p.date or "")
+            local kept = {}
+            for line in (newc .. "\n"):gmatch("([^\n]*)\n") do
+                if not line:match("^%-%- %[HUBCAP%-BUILD%]") then kept[#kept + 1] = line end
+            end
+            table.insert(kept, 1, stamp)
+            newc = table.concat(kept, "\n")
+            m_utils.write_file(glua, newc)
+        end
+        log("freeze-build appid=" .. appid .. " build=" .. tostring(p.build or "?") ..
+            " pinned=" .. #applied .. " carried=" .. #carried .. " ignored=" .. #skipped)
+        return { success = true, changed = changed, applied = applied,
+                 carried = carried, ignored = skipped, build = p.build }
+    end)
+    if not ok then return json_err(res) end
+    return json_ok(res)
+end
+
 -- revert a depot back to the original manifest
 function HubcapRevert(contentScriptQuery, payload)
     local ok, res = pcall(function()
@@ -539,7 +678,14 @@ function HubcapRevert(contentScriptQuery, payload)
             local c2, ch2, m2 = luaedit.revert(newc, d)
             if ch2 then newc, changed, msg = c2, true, m2 end
         end
-        if changed then m_utils.write_file(glua, newc) end
+        if changed then
+            local kept = {}
+            for line in (newc .. "\n"):gmatch("([^\n]*)\n") do
+                if not line:match("^%-%- %[HUBCAP%-BUILD%]") then kept[#kept + 1] = line end
+            end
+            newc = table.concat(kept, "\n")
+            m_utils.write_file(glua, newc)
+        end
         log("revert appid=" .. appid .. " depots=" .. #targets .. " (" .. tostring(msg) .. ")")
         return { success = true, changed = changed, message = msg, depot = depot }
     end)
@@ -560,11 +706,16 @@ function HubcapGrabClipboard(contentScriptQuery, payload)
         local script = fs.join(pd, "backend", "scripts", "ostlua_grab.ps1")
         local result_file = clip_result_path(depot)
         pcall(fs.remove, result_file)
-        local title = "Depot " .. depot
+        local title = tostring(p.title or ("Depot " .. depot))
+        -- Regex the helper uses to decide the copy worked. Defaults to a plain
+        -- manifest id; build pages pass their own (see grabSteamDb).
+        local accept = tostring(p.accept or "")
+        if accept == "" then accept = "\\d{12,}" end
         local launcher = fs.join(ensure_data_dir(), "run_grab_" .. depot .. ".cmd")
         local body = "@echo off\r\n" ..
             'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' .. script ..
-            '" -ResultFile "' .. result_file .. '" -Auto ' .. auto .. ' -Title "' .. title .. '"\r\n'
+            '" -ResultFile "' .. result_file .. '" -Auto ' .. auto ..
+            ' -Title "' .. title .. '" -Accept "' .. accept .. '"\r\n'
         m_utils.write_file(launcher, body)
         m_utils.exec('start /b cmd /C "' .. launcher .. '"')
         return { success = true, started = true }

@@ -2,8 +2,8 @@
   "$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/sys/plugin-schema.json",
   "name": "ostlua",
   "common_name": "OSTLua",
-  "description": "Install game manifests and freeze / downgrade versions from the store page.",
-  "version": "1.4.2",
+  "description": "Install game manifests and downgrade games to any Steam build from the store page.",
+  "version": "1.5.0",
   "backendType": "lua",
   "include": [
     "public"

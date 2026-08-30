@@ -5,6 +5,8 @@
   var PLUGIN = "ostlua";
   var ACCENT = "#a06bff";
 
+  var ACCEPT_BUILDS = "patchnotes/\\d{7,10}";
+
   function call(method, args) {
     return new Promise(function (resolve) {
       try {
@@ -140,8 +142,6 @@
       ".hubcap-install{display:flex;flex-direction:column;align-items:center;gap:14px;padding:20px 10px 8px;text-align:center;}",
       ".hubcap-install .hc-shield{width:50px;height:50px;opacity:.9;}.hubcap-install .msg{font:500 13px/1.55 'Motiva Sans';color:#aab2bf;max-width:430px;}",
       ".hubcap-depot{border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px 16px;margin-bottom:14px;background:rgba(255,255,255,.02);}",
-      ".hubcap-warn{margin-top:10px;padding:10px 12px;border-radius:10px;background:rgba(224,176,85,.09);border:1px solid rgba(224,176,85,.35);font:400 12px/1.5 'Motiva Sans';color:#e6d3ac;}",
-      ".hubcap-warn b{color:#f0c674;}",
       ".hubcap-migrate{position:fixed;right:20px;bottom:20px;z-index:99999;width:390px;max-width:calc(100vw - 40px);background:#1b2129;border:1px solid rgba(160,107,255,.45);border-radius:14px;padding:16px 18px;box-shadow:0 14px 40px rgba(0,0,0,.6);font:400 13px/1.55 'Motiva Sans',Arial,sans-serif;color:#c7cdd6;}",
       ".hubcap-migrate .mt{font:700 14px/1.3 'Motiva Sans';color:#fff;margin-bottom:7px;}",
       ".hubcap-migrate .mm{color:#9aa4b2;font-size:12.5px;}",
@@ -334,7 +334,9 @@
         var title = gameName ? (gameName + '  ·  depot ' + dp.depot) : ('Depot ' + dp.depot);
         card.innerHTML = '<div class="row"><span class="did">' + title + '</span>' +
           '<span class="hubcap-badge ' + (dp.frozen ? "frozen" : "live") + '">' + (dp.frozen ? "Frozen" : "Live") + '</span></div>' +
-          '<div class="hubcap-mid">current: ' + (dp.current || "not set") + (dp.frozen && dp.original ? '<br>original: ' + dp.original : '') + '</div>' +
+          '<div class="hubcap-mid">current: ' + (dp.current || "not set") +
+            (st.build ? '  \u00b7  build ' + st.build + (st.buildDate ? ' \u00b7 ' + shortDate(st.buildDate) : '') : '') +
+            (dp.frozen && dp.original ? '<br>original: ' + dp.original : '') + '</div>' +
           '<div class="hc-ver"></div>';
         host.appendChild(card);
         renderVersionPicker(card.querySelector(".hc-ver"), appid, dp, overlay);
@@ -350,209 +352,263 @@
     });
   }
 
-  // `date` is the build date of the chosen version. The backend uses it to pin
-  // every OTHER depot to the manifest it had at that build, so the whole game
-  // lands on one build instead of base-depot-old + other-depot-latest.
+  // ── SteamDB build pages ────────────────────────────────────────────────────
+  // Two pages replace the old per-depot scraping:
+  //   app/<appid>/patchnotes/   -> every build:  date + BuildID
+  //   patchnotes/<buildid>/     -> that build's depots + their new manifest
+  // One build page pins the whole game, so there is no per-depot tab juggling
+  // and no dropdown with 400 manifest rows.
 
-  // Load one depot's SteamDB version history.
+  // Build list -> [{date, build}].
   //
-  // Script injection can't help here: Millennium 3.4.x only intercepts
-  // steamloopback.host and the steam TLDs, so nothing of ours runs on
-  // steamdb.info. We open the page and let the helper copy it, same as the main
-  // depot. Deliberately ONE depot per click - chaining tabs automatically was
-  // unreliable (Steam's browser would only honour the first window.open).
-  function loadOneDepot(depot, statusEl, done) {
-    function say(m) { if (statusEl) statusEl.textContent = m; }
-    say("Opening SteamDB for depot " + depot + "…");
-    var w = null;
-    try { w = window.open("https://steamdb.info/depot/" + depot + "/manifests/", "_blank"); }
-    catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + depot + "/manifests/" }); }
+  // The whole app page is in the clipboard, not just the builds table: the
+  // header carries the store Release Date, and other tabs link builds too
+  // (branches table, tested_build_id). Pairing "nearest date before the link"
+  // across that soup shifted every row by one. So scope to a single <tr>: a row
+  // holds exactly one build and one date. Prefer the ISO datetime attribute,
+  // which is exact, over the rendered prose.
+  var MONTH_NAMES = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
 
+  function isoToPretty(y, m, d) {
+    var name = MONTH_NAMES[parseInt(m, 10) - 1] || m;
+    return parseInt(d, 10) + " " + name + " " + y;
+  }
+
+  // "13 March 2026" -> 20260313, for sorting newest first
+  function dateKey(str) {
+    var m = String(str || "").match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+    if (!m) return 0;
+    var mi = -1;
+    for (var i = 0; i < MONTH_NAMES.length; i++) {
+      if (MONTH_NAMES[i].toLowerCase().indexOf(m[2].toLowerCase()) === 0) { mi = i + 1; break; }
+    }
+    if (mi < 0) return 0;
+    return parseInt(m[3], 10) * 10000 + mi * 100 + parseInt(m[1], 10);
+  }
+
+  function parseBuildList(text, excludeId) {
+    text = text || "";
+    var out = [], seen = {};
+
+    if (/<tr[\s>]/i.test(text)) {
+      // A build can appear in more than one table - the Depots tab's branches
+      // row links the current build too, dated by when it was BUILT rather than
+      // released. The Builds table comes later in the page, so let a later row
+      // win, then sort newest first so page order stops mattering at all.
+      var byId = {};
+      text.split(/<tr[\s>]/i).forEach(function (row) {
+        var idm = row.match(/patchnotes\/(\d{6,10})\//);
+        if (!idm) return;
+        var id = idm[1];
+        if (id === String(excludeId)) return;
+
+        var date = "";
+        var iso = row.match(/datetime="(\d{4})-(\d{2})-(\d{2})/);
+        if (iso) date = isoToPretty(iso[1], iso[2], iso[3]);
+        else {
+          var pm = row.match(/(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})/);
+          if (pm) date = pm[1];
+        }
+        if (!date) return;          // no date in this row -> not a build row
+        byId[id] = date;            // later row overwrites earlier
+      });
+
+      Object.keys(byId).forEach(function (id) { out.push({ date: byId[id], build: id }); });
+      if (out.length) {
+        out.sort(function (a, b) { return dateKey(b.date) - dateKey(a.date); });
+        return out;
+      }
+    }
+
+    // text flavor: "13 March 2026  Fri  05:16  No title  22277314"
+    text.split(/\r?\n/).forEach(function (L) {
+      var d = L.match(/(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})/);
+      if (!d) return;
+      var ids = L.match(/\b\d{7,10}\b/g);
+      if (!ids) return;
+      var b = ids[ids.length - 1];
+      if (b === String(excludeId) || seen[b]) return;
+      seen[b] = 1;
+      out.push({ date: d[1], build: b });
+    });
+    return out;
+  }
+
+  // From a build page: the depots it changed and their NEW manifest.
+  //
+  // The clipboard's HTML flavor is ONE long line, so this has to scan the whole
+  // blob with a global regex - matching per line only ever returned the first
+  // depot, which is why applies reported "pinned 1 depot".
+  //
+  // Each depot heading links to ?changeid=M:<new manifest>. The "Manifest ID
+  // changed" rows link the OLD id too, but the heading comes first and we keep
+  // the first sighting, so the new one wins. Text flavor is the fallback: there
+  // the ids only show up once a depot's file list has lazy-loaded.
+  function parseBuildDepots(text) {
+    text = text || "";
+    var out = [], seen = {}, m;
+
+    var re = /depot\/(\d{4,})\/history\/\?changeid=M:(\d{12,})/g;
+    while ((m = re.exec(text)) !== null) {
+      if (seen[m[1]]) continue;
+      seen[m[1]] = 1;
+      out.push({ depot: m[1], manifest: m[2] });
+    }
+    if (out.length) return out;
+
+    // plain text: "Depot 3764201" … "Manifest ID changed - <old> > <new>"
+    var cur = null;
+    text.split(/\r?\n/).forEach(function (L) {
+      var dm = L.match(/Depot[^\d]{0,4}(\d{4,})/);
+      if (dm) { cur = dm[1]; return; }
+      if (/Manifest ID changed/i.test(L)) {
+        var ids = L.match(/\d{12,}/g);
+        if (cur && ids && ids.length && !seen[cur]) {
+          seen[cur] = 1;
+          out.push({ depot: cur, manifest: ids[ids.length - 1] });
+        }
+        cur = null;
+      }
+    });
+    return out;
+  }
+
+  // Clears the pins on every depot of this game (the backend walks them all,
+  // since a build apply pins them together).
+  function doRevert(appid, dp, overlay) {
+    call("HubcapRevert", { appid: appid, depotid: dp.depot }).then(function (r) {
+      if (r && r.success) toast(r.changed ? "Reverted to original" : "Nothing to revert");
+      else toast((r && r.error) || "Failed", false);
+      refresh(appid, overlay);
+    });
+  }
+
+  // Opening a SteamDB tab only works from a real user gesture. From a timer
+  // Steam silently refuses (window.open returns null rather than throwing), so
+  // anything needing a page must open it on the click and read it later - which
+  // is what Quick Install does while the lua downloads.
+  function openSteamDb(url) {
+    try { window.open(url, "_blank"); } catch (e) {}
+  }
+
+  // Read whichever SteamDB tab is open, matched by `title`. `key` namespaces the
+  // helper's result file, `accept` is the regex it uses to know the copy worked.
+  // The helper closes the tab when done.
+  function readSteamDb(key, accept, title, waitMs, say, cb) {
     setTimeout(function () {
-      say("Copying depot " + depot + "…");
-      call("HubcapGrabClipboard", { depot: depot, auto: true }).then(function () {
+      if (say) say("Reading the page\u2026");
+      call("HubcapGrabClipboard", { depot: key, auto: true, accept: accept, title: title }).then(function () {
         var tries = 0;
         var iv = startPoll(function () {
           tries++;
-          call("HubcapGrabResult", { depot: depot }).then(function (r) {
-            if (r && r.state === "done") {
-              clearInterval(iv);
-              var parsed = parseManifestText(r.text || "");
-              if (parsed.length) {
-                call("HubcapSaveManifests", { depot: depot, manifests: parsed }).then(function () {
-                  say("Depot " + depot + ": " + parsed.length + " versions saved.");
-                  try { if (w) w.close(); } catch (e) {}
-                  if (done) done(true, parsed.length);
-                });
-              } else {
-                say("Depot " + depot + ": nothing copied — open it yourself, Ctrl+A then Ctrl+C, and hit Grab.");
-                if (done) done(false, 0);
-              }
-            } else if (tries > 45) {
-              clearInterval(iv);
-              say("Depot " + depot + ": timed out reading the page.");
-              if (done) done(false, 0);
-            }
+          call("HubcapGrabResult", { depot: key }).then(function (r) {
+            if (r && r.state === "done") { clearInterval(iv); cb(r.text || ""); }
+            else if (tries > 60)         { clearInterval(iv); cb(""); }
           });
         }, 400);
       });
-    }, 3000);
+    }, waitMs || 900);
   }
 
-  function applyManifest(appid, dp, id, overlay, date) {
-    call("HubcapFreeze", { appid: appid, depotid: dp.depot, manifestid: id, date: date || "" }).then(function (r) {
-      if (r && r.success) {
-        var n = (r.applied || []).length;
-        var un = r.unresolved || [];
-        toast(n > 1 ? ("Pinned " + n + " depots to this build") : (r.message || "Applied"));
-        if (un.length) {
-          toast("No version history for depot" + (un.length > 1 ? "s " : " ") + un.join(", ") +
-                " — load their versions or they stay on latest", false);
-        }
-      } else toast((r && r.error) || "Failed", false);
-      refresh(appid, overlay);
-    });
-  }
-  function doRevert(appid, dp, overlay) {
-    call("HubcapRevert", { appid: appid, depotid: dp.depot }).then(function (r) {
-      if (r && r.success) toast("Reverted to original"); else toast((r && r.error) || "Failed", false);
-      refresh(appid, overlay);
-    });
+  // Open then read, for buttons that do both off one click.
+  function grabSteamDb(url, key, accept, title, waitMs, say, cb) {
+    openSteamDb(url);
+    readSteamDb(key, accept, title, waitMs, say, cb);
   }
 
   function renderVersionPicker(host, appid, dp, overlay) {
-    host.innerHTML = '<div class="hubcap-note2">Loading versions…</div>';
-    call("HubcapGetManifests", { depot: dp.depot }).then(function (r) {
-      var list = (r && r.manifests) || [];
+    host.innerHTML = '<div class="hubcap-note2">Loading builds…</div>';
+    call("HubcapGetBuilds", { appid: appid }).then(function (r) {
+      var builds = (r && r.builds) || [];
       host.innerHTML = "";
-      if (list.length > 0) {
-        var bar = el('<div class="hubcap-in"></div>');
-        var sel = document.createElement("select"); sel.className = "hubcap-select";
-        sel.appendChild(new Option("— choose a version (" + list.length + ") —", ""));
-        list.forEach(function (mm) { sel.appendChild(new Option(shortDate(mm.date) + "   —   " + mm.id, mm.id)); });
-        var applyB = el('<button class="hubcap-btn p">Apply</button>');
-        var reB = el('<button class="hubcap-btn g" title="Reload versions">&#x21bb;</button>');
-        bar.appendChild(sel); bar.appendChild(reB); bar.appendChild(applyB);
-        if (dp.frozen) { var rv = el('<button class="hubcap-btn r">Revert</button>'); bar.appendChild(rv); rv.onclick = function () { doRevert(appid, dp, overlay); }; }
-        host.appendChild(bar);
 
-        // Other depots with no cached history. They can't be pinned to the
-        // chosen build, so they'd stay on the newest one — which is what makes a
-        // "downgrade" come out half-old, half-new.
-        call("HubcapStatus", { appid: appid }).then(function (st2) {
-          var missing = [];
-          ((st2 && st2.depots) || []).forEach(function (d) {
-            if (!d.isMain && !d.hasVersions) missing.push(d.depot);
-          });
-          if (!missing.length) return;
-          var warn = el('<div class="hubcap-warn"></div>');
-          warn.innerHTML = '<b>' + missing.length + ' other depot' + (missing.length > 1 ? 's have' : ' has') +
-            ' no version history.</b> The game files are split across several depots — any depot ' +
-            'left without history stays on the newest build, so the game ends up part old, part new. ' +
-            'Load them one at a time:';
-          var stat = document.createElement("div"); stat.className = "hubcap-note2"; stat.style.marginTop = "8px";
-          missing.forEach(function (d) {
-            var row = el('<div class="hubcap-in" style="margin-top:6px"></div>');
-            var lbl = document.createElement("span");
-            lbl.className = "hubcap-note2"; lbl.style.flex = "1"; lbl.textContent = "Depot " + d;
-            var b = el('<button class="hubcap-btn g">Load versions</button>');
-            row.appendChild(lbl); row.appendChild(b); warn.appendChild(row);
-            b.onclick = function () {
-              b.disabled = true;
-              loadOneDepot(d, stat, function (okk) {
-                if (okk) { toast("Depot " + d + " loaded"); refresh(appid, overlay); }
-                else { b.disabled = false; toast("Couldn't read depot " + d, false); }
-              });
-            };
-          });
-          warn.appendChild(stat);
-          host.appendChild(warn);
-        });
+      var status = el('<div class="hubcap-note2" style="margin-top:8px"></div>');
+      function say(m) { status.textContent = m; }
 
-        applyB.onclick = function () {
-          if (!sel.value) { toast("Pick a version", false); return; }
-          var hit = null;
-          for (var i = 0; i < list.length; i++) if (String(list[i].id) === String(sel.value)) { hit = list[i]; break; }
-          applyManifest(appid, dp, sel.value, overlay, hit && hit.date);
+      if (!builds.length) {
+        var b0 = el('<button class="hubcap-btn p wide">Load builds from SteamDB</button>');
+        host.appendChild(b0); host.appendChild(status);
+        host.appendChild(el('<div class="hubcap-note2" style="margin-top:8px;opacity:.85">Reads the game\u2019s build list once. Then pick a build and hit Apply \u2014 OSTLua fetches that build\u2019s depot manifests at that moment and pins them all.</div>'));
+        b0.onclick = function () {
+          b0.disabled = true;
+          say("Opening SteamDB build list\u2026");
+          grabSteamDb("https://steamdb.info/app/" + appid + "/patchnotes/", appid,
+                      ACCEPT_BUILDS, "Patches and Updates", 1500, say, function (text) {
+            var list = parseBuildList(text, appid);
+            if (!list.length) { say("Couldn\u2019t read the build list \u2014 make sure the SteamDB tab finished loading, then try again."); b0.disabled = false; return; }
+            call("HubcapSaveBuilds", { appid: appid, builds: list }).then(function () {
+              toast("Found " + list.length + " builds");
+              renderVersionPicker(host, appid, dp, overlay);
+            });
+          });
         };
-        reB.onclick = function () { call("HubcapSaveManifests", { depot: dp.depot, manifests: [] }).then(function () { toast("Cleared — reload from SteamDB"); showSources(host, appid, dp, overlay); }); };
-      } else {
-        showSources(host, appid, dp, overlay);
+        return;
       }
+
+      var bar = el('<div class="hubcap-in"></div>');
+      var sel = document.createElement("select"); sel.className = "hubcap-select";
+      sel.appendChild(new Option("\u2014 choose a build (" + builds.length + ") \u2014", ""));
+      builds.forEach(function (b) {
+        sel.appendChild(new Option(shortDate(b.date) + "   \u2014   build " + b.build, b.build));
+      });
+      var applyB = el('<button class="hubcap-btn p">Apply</button>');
+      var reB = el('<button class="hubcap-btn g" title="Reload build list">&#x21bb;</button>');
+      bar.appendChild(sel); bar.appendChild(reB); bar.appendChild(applyB);
+      if (dp.frozen) {
+        var rv = el('<button class="hubcap-btn r">Revert</button>');
+        bar.appendChild(rv);
+        rv.onclick = function () { doRevert(appid, dp, overlay); };
+      }
+      host.appendChild(bar); host.appendChild(status);
+      host.appendChild(el('<div class="hubcap-note2" style="margin-top:8px;opacity:.8">Apply opens that build\u2019s SteamDB page, reads every depot\u2019s manifest from it, and pins them together.</div>'));
+
+      reB.onclick = function () {
+        call("HubcapSaveBuilds", { appid: appid, builds: [] }).then(function () {
+          renderVersionPicker(host, appid, dp, overlay);
+        });
+      };
+
+      applyB.onclick = function () {
+        if (!sel.value) { toast("Pick a build", false); return; }
+        var build = sel.value;
+        var buildDate = "";
+        for (var bi = 0; bi < builds.length; bi++)
+          if (String(builds[bi].build) === String(build)) { buildDate = builds[bi].date; break; }
+        applyB.disabled = true; sel.disabled = true;
+        // the list tab may still be open; a second SteamDB window is exactly
+        // what confused the window picker before
+        try { if (window.__ostluaDbTab && !window.__ostluaDbTab.closed) window.__ostluaDbTab.close(); } catch (e) {}
+        say("Opening build " + build + " on SteamDB\u2026");
+        grabSteamDb("https://steamdb.info/patchnotes/" + build + "/", build,
+                    "changeid=M:\\d+", "update for", 900, say, function (text) {
+          var pins = parseBuildDepots(text);
+          if (!pins.length) {
+            say("Couldn\u2019t read that build page \u2014 open it yourself, Ctrl+A / Ctrl+C, then hit Apply again.");
+            applyB.disabled = false; sel.disabled = false;
+            return;
+          }
+          say("Pinning " + pins.length + " depot(s) from build " + build + "\u2026");
+          call("HubcapFreezePins", { appid: appid, pins: pins, build: build,
+                                     date: buildDate }).then(function (res) {
+            applyB.disabled = false; sel.disabled = false;
+            if (res && res.success) {
+              // Every depot ends up pinned: some get a new manifest from this
+              // build, the rest were already on the right one for it. Saying
+              // "pinned 2 (+3 unchanged)" read like a partial failure.
+              var n = (res.applied || []).length, c = (res.carried || []).length;
+              var total = n + c;
+              toast("Locked all " + total + " depots to build " + build +
+                    (buildDate ? " (" + shortDate(buildDate) + ")" : "") +
+                    " — " + n + " changed in this build");
+              refresh(appid, overlay);
+            } else {
+              toast((res && res.error) || "Failed", false);
+            }
+          });
+        });
+      };
     });
-  }
-
-  function showSources(host, appid, dp, overlay) {
-    host.innerHTML = "";
-    var wrap = el('<div></div>');
-    var autoB = el('<button class="hubcap-btn p wide">Load versions from SteamDB (auto)</button>');
-    wrap.appendChild(autoB);
-    var status = el('<div class="hubcap-note2" style="margin-top:10px"></div>'); wrap.appendChild(status);
-    wrap.appendChild(el('<div class="hubcap-note2" style="margin-top:8px;opacity:.85">Auto opens SteamDB, copies the page and reads the versions. If it misses, open it yourself, press <b>Ctrl+A</b> then <b>Ctrl+C</b>, and click Grab:</div>'));
-    var row1 = el('<div class="hubcap-in"></div>');
-    var openB = el('<button class="hubcap-btn g">Open SteamDB &#8599;</button>');
-    var grabB = el('<button class="hubcap-btn g">Grab clipboard</button>');
-    row1.appendChild(openB); row1.appendChild(grabB); wrap.appendChild(row1);
-    wrap.appendChild(el('<div class="hubcap-note2" style="margin-top:10px;opacity:.7">…or paste it here:</div>'));
-    var ta = document.createElement("textarea"); ta.className = "hubcap-ta"; ta.placeholder = "Paste the copied SteamDB page here…"; wrap.appendChild(ta);
-    var man = el('<div class="hubcap-in" style="margin-top:8px"><input placeholder="…or a single manifest ID" /><button class="hubcap-btn g">Apply</button></div>'); wrap.appendChild(man);
-    if (dp.frozen) { var rv = el('<div style="margin-top:8px"><button class="hubcap-btn r">Revert to original</button></div>'); wrap.appendChild(rv); rv.querySelector("button").onclick = function () { doRevert(appid, dp, overlay); }; }
-    host.appendChild(wrap);
-
-    function useText(text) {
-      var parsed = parseManifestText(text || "");
-      if (parsed.length > 0) {
-        status.textContent = "Found " + parsed.length + " versions — saving…";
-        call("HubcapSaveManifests", { depot: dp.depot, manifests: parsed }).then(function () {
-          toast("Loaded " + parsed.length + " versions"); renderVersionPicker(host, appid, dp, overlay);
-        });
-        return true;
-      }
-      return false;
-    }
-    function pollGrab(onDone) {
-      var tries = 0;
-      var iv = startPoll(function () {
-        tries++;
-        call("HubcapGrabResult", { depot: dp.depot }).then(function (r) {
-          if (r && r.state === "done") {
-            clearInterval(iv);
-            var okk = useText(r.text);
-            if (!okk) status.textContent = "No versions on the clipboard — copy the SteamDB page, or paste below.";
-            if (onDone) onDone(okk);
-          } else if (tries > 40) { clearInterval(iv); status.textContent = "Timed out reading clipboard."; if (onDone) onDone(false); }
-        });
-      }, 400);
-    }
-    function openDb() {
-      try { return window.open("https://steamdb.info/depot/" + dp.depot + "/manifests/", "_blank"); }
-      catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + dp.depot + "/manifests/" }); return null; }
-    }
-
-    autoB.onclick = function () {
-      toast("Opening SteamDB…");
-      var w = openDb();
-      status.textContent = "Opening SteamDB, waiting for the page…";
-      // A freshly opened SteamDB tab needs time to render (and can show a
-      // Cloudflare check first). 400ms copied an empty page more often than not.
-      setTimeout(function () {
-        status.textContent = "Copying versions from SteamDB…";
-        call("HubcapGrabClipboard", { depot: dp.depot, auto: true }).then(function () {
-          pollGrab(function () { try { if (w) w.close(); } catch (e) {} });   // backup close
-        });
-      }, 3000);
-    };
-    openB.onclick = openDb;
-    grabB.onclick = function () {
-      status.textContent = "Reading clipboard…";
-      call("HubcapGrabClipboard", { depot: dp.depot, auto: false }).then(function () { pollGrab(); });
-    };
-    man.querySelector("button").onclick = function () {
-      var id = (man.querySelector("input").value || "").replace(/[^0-9]/g, "");
-      if (!id) { toast("Enter a manifest ID", false); return; }
-      applyManifest(appid, dp, id, overlay);
-    };
-    ta.addEventListener("input", function () { setTimeout(function () { if (ta.value.trim() && !useText(ta.value)) status.textContent = "No manifest IDs found in that text."; }, 60); });
   }
 
   function updateAllFabs() {
@@ -568,52 +624,57 @@
   // One-click: install the lua+manifests, then auto-open SteamDB for THIS game's
   // main depot and load its version list. Single game only — no bulk scraping.
   function quickInstall(appid, qbtn) {
-    function done(msg, ok) { toast(msg, ok !== false); if (qbtn) { qbtn.classList.remove("busy"); qbtn.querySelector("span").textContent = "Quick Install"; } }
-    if (qbtn) { qbtn.classList.add("busy"); qbtn.querySelector("span").textContent = "Downloading…"; }
-    toast("Quick Install: downloading lua + manifests…");
-    call("HubcapInstall", { appid: appid }).then(function (r) {
-      if (!r || !r.success) { done((r && r.error) || "Couldn't start install", false); return; }
-      var tries = 0;
-      var poll = startPoll(function () {
-        tries++;
-        call("HubcapInstallStatus", { appid: appid }).then(function (s) {
-          if (s && s.state === "done") {
-            clearInterval(poll);
-            if (!s.success) { done(s.error || "Install failed", false); return; }
-            updateAllFabs();
-            if (qbtn) qbtn.querySelector("span").textContent = "Fetching versions…";
-            toast("Installed from " + (s.source || "?") + " — fetching versions…");
-            call("HubcapStatus", { appid: appid }).then(function (st) {
-              var depot = st && st.depot && st.depot.depot;
-              if (!depot) { done("Installed, but no main depot found in the lua", false); return; }
-              var w;
-              try { w = window.open("https://steamdb.info/depot/" + depot + "/manifests/", "_blank"); }
-              catch (e) { call("HubcapOpenUrl", { url: "https://steamdb.info/depot/" + depot + "/manifests/" }); }
-              setTimeout(function () {
-                call("HubcapGrabClipboard", { depot: depot, auto: true }).then(function () {
-                  var gt = 0;
-                  var iv = startPoll(function () {
-                    gt++;
-                    call("HubcapGrabResult", { depot: depot }).then(function (g) {
-                      if (g && g.state === "done") {
-                        clearInterval(iv);
-                        try { if (w) w.close(); } catch (e) {}
-                        var parsed = parseManifestText(g.text || "");
-                        if (parsed.length > 0) {
-                          call("HubcapSaveManifests", { depot: depot, manifests: parsed }).then(function () {
-                            done("Quick Install done — " + parsed.length + " versions loaded");
-                          });
-                        } else { done("Installed, but couldn't read versions — open OSTLua to load them", false); }
-                      } else if (gt > 40) { clearInterval(iv); try { if (w) w.close(); } catch (e) {} done("Installed — version fetch timed out, open OSTLua to retry", false); }
-                    });
-                  }, 400);
-                });
-              }, 400);
-            });
-          } else if (tries > 100) { clearInterval(poll); done("Install timed out — check your API key / source", false); }
-        });
-      }, 1200);
+    function label(t) { if (qbtn) qbtn.querySelector("span").textContent = t; }
+    function done(msg, ok) { toast(msg, ok !== false); if (qbtn) { qbtn.classList.remove("busy"); label("Quick Install"); } }
+    if (qbtn) qbtn.classList.add("busy");
+
+    // Builds FIRST, lua second.
+    //
+    // Steam only honours window.open during a real click, so the SteamDB page
+    // has to be opened from this handler - not from a callback after the
+    // install. Doing the read up front means the window is only up for the
+    // couple of seconds it takes to copy the page, instead of sitting there for
+    // the whole download waiting to be closed by the user.
+    label("Reading builds\u2026");
+    toast("Quick Install: reading builds from SteamDB\u2026");
+
+    grabSteamDb("https://steamdb.info/app/" + appid + "/patchnotes/", appid,
+                ACCEPT_BUILDS, "Patches and Updates", 1500,
+                function (m) { label(m); },
+                function (text) {
+      var list = parseBuildList(text, appid);
+      if (list.length) {
+        call("HubcapSaveBuilds", { appid: appid, builds: list });
+      }
+      installLua(list.length);
     });
+
+    function installLua(buildCount) {
+      label("Downloading\u2026");
+      toast("Downloading lua + manifests\u2026");
+      call("HubcapInstall", { appid: appid }).then(function (r) {
+        if (!r || !r.success) { done((r && r.error) || "Couldn't start install", false); return; }
+        var tries = 0;
+        var poll = startPoll(function () {
+          tries++;
+          call("HubcapInstallStatus", { appid: appid }).then(function (st) {
+            if (st && st.state === "done") {
+              clearInterval(poll);
+              if (!st.success) { done(st.error || "Install failed", false); return; }
+              updateAllFabs();
+              if (buildCount) {
+                done("Quick Install done \u2014 " + buildCount + " builds loaded, pick one and Apply");
+              } else {
+                done("Installed from " + (st.source || "?") +
+                     " \u2014 couldn't read builds, use Load builds in OSTLua", false);
+              }
+            } else if (tries > 100) {
+              clearInterval(poll); done("Install timed out \u2014 check your API key / source", false);
+            }
+          });
+        }, 1200);
+      });
+    }
   }
 
   function ensureFab() {
