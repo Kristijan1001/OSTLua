@@ -1,3 +1,5 @@
+<a href="https://buymeacoffee.com/kristijan1001" target="_blank"> <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="160" alt="Buy Me a Coffee"> </a>
+
 # OSTLua
 <img width="480" height="347" alt="image" src="https://github.com/user-attachments/assets/99a8c8d2-789c-49bf-bd4c-16c92cb4630c" />
 
