@@ -42,7 +42,7 @@
 3. Enable **OSTLua** in Millennium's plugin manager.
 4. **Restart Steam.**
 
-No config files to set up — the plugin creates everything on first run. Open the **OSTLua** button on any store page to add your Hubcap API key (optional; the free sources need no key).
+The plugin creates its config files on first run. Open **OSTLua** on a Steam store page to choose a source. Hubcap uses a Hubcap API key. For Luie, select **Luie** or enable source fallback, then click **Sign in with Discord** and authorize lua.tools in your browser. You can also run `/login` in the LuaTools Discord and enter the six-character code in OSTLua. Ryuu, Sushi, and Revo require no sign-in.
 
 ### Still on OpenSteamTool?
 
