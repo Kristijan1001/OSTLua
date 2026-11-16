@@ -56,8 +56,21 @@ try {
             if (Test-Path $ext) { Remove-Item $ext -Recurse -Force -ErrorAction SilentlyContinue }
 
             $headers = @{}
-            if ($src.auth) { $headers["Authorization"] = "Bearer $apiKey" }
-            Invoke-WebRequest -Uri $src.url -Headers $headers -OutFile $tmp -UseBasicParsing `
+            $url = $src.url
+            if ($src.id -eq "luie") {
+                # Keep the session token scoped to the lua.tools download endpoint.
+                $url = "https://lua.tools/api/manifest/download?appid=$AppId&source=Luie"
+                $sessionPath = Join-Path $PluginDir "backend\data\luie-session.json"
+                if (-not (Test-Path -LiteralPath $sessionPath)) { throw "Sign in to lua.tools in OSTLua first." }
+                $session = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
+                if (-not $session.access_token -or $session.expires_at -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) {
+                    throw "Could not refresh the lua.tools session. Try again or sign in again."
+                }
+                $headers["Authorization"] = "Bearer $($session.access_token)"
+            } elseif ($src.auth) {
+                $headers["Authorization"] = "Bearer $apiKey"
+            }
+            Invoke-WebRequest -Uri $url -Headers $headers -OutFile $tmp -UseBasicParsing `
                 -UserAgent "OSTLua/1.0" -TimeoutSec 20
 
             # ZIP (starts with "PK") vs raw .lua text.

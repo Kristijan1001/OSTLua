@@ -56,14 +56,15 @@ local function read_config()
     return (ok and type(d) == "table") and d or {}
 end
 
--- Lua download sources. Hubcap needs the API key (auth); the others are
--- free/keyless. "{appid}" is substituted per request. An unknown saved
+-- Hubcap uses the configured API key. Luie uses a separate lua.tools session.
+-- "{appid}" is substituted per request. An unknown saved
 -- main_source (e.g. the retired TwentyTwo Cloud) falls back to Hubcap.
 local SOURCES = {
     { id = "hubcap",    name = "Hubcap",          auth = true  },  -- url from api_base
     { id = "ryuu",      name = "Ryuu",            auth = false, url = "http://167.235.229.108/{appid}" },
     { id = "sushi",     name = "Sushi",           auth = false, url = "https://raw.githubusercontent.com/sushi-dev55-alt/sushitools-games-repo-alt/refs/heads/main/{appid}.zip" },
     { id = "revobd",    name = "Revo",            auth = false, url = "https://api.luagen.revobd.club/{appid}.zip" },
+    { id = "luie",      name = "Luie",            auth = false, url = "https://lua.tools/api/manifest/download?appid={appid}&source=Luie" },
 }
 
 local function source_url(s, appid, cfg)
@@ -81,7 +82,7 @@ local function build_source_order(appid, cfg)
     local order, main_found = {}, false
     for _, s in ipairs(SOURCES) do
         if s.id == main then
-            order[#order + 1] = { name = s.name, url = source_url(s, appid, cfg), auth = s.auth }
+            order[#order + 1] = { id = s.id, name = s.name, url = source_url(s, appid, cfg), auth = s.auth }
             main_found = true
         end
     end
@@ -93,7 +94,7 @@ local function build_source_order(appid, cfg)
     if fallback then
         for _, s in ipairs(SOURCES) do
             if s.id ~= main then
-                order[#order + 1] = { name = s.name, url = source_url(s, appid, cfg), auth = s.auth }
+                order[#order + 1] = { id = s.id, name = s.name, url = source_url(s, appid, cfg), auth = s.auth }
             end
         end
     end
@@ -166,6 +167,9 @@ local function sweep_data_dir()
         local transient = is_file and (
             name:match("^run_install_%d+%.cmd$") or
             name:match("^run_grab_%d+%.cmd$")    or
+            name:match("^luie_discord_%d+_%d+%.cmd$") or
+            name:match("^luie_discord_%d+_%d+%.json$") or
+            name:match("^luie_discord_%d+_%d+%.json%.tmp$") or
             name:match("^sources_%d+%.json$")    or
             name:match("^install_%d+%.json$")    or
             name:match("^clip_%d+%.txt$")        or
@@ -338,6 +342,182 @@ local function install_result_path(appid)
     return fs.join(ensure_data_dir(), "install_" .. tostring(appid) .. ".json")
 end
 
+local LUIE_AUTH_URL = "https://db.lua.tools/auth/v1/"
+-- Public anonymous client key used by the lua.tools sign-in service.
+local LUIE_CLIENT_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    .. "eyJpYXQiOjE3NzYwMzkzNzYsImV4cCI6MTg5MzQ1NjAwMCwicm9sZSI6ImFub24iLCJpc3MiOiJzdXBhYmFzZSJ9."
+    .. "f_-K38u3odjltP-g_67FVmG32Vg-_-k-lNBvIaVUVBM"
+
+local function luie_session_path()
+    return fs.join(ensure_data_dir(), "luie-session.json")
+end
+
+local function read_luie_session()
+    local path = luie_session_path()
+    if not fs.exists(path) then return nil end
+    local ok, session = pcall(function() return cjson.decode(m_utils.read_file(path)) end)
+    if ok and type(session) == "table" and type(session.refresh_token) == "string" then
+        return session
+    end
+end
+
+local function luie_post(url, payload, client_key)
+    if not m_http then return nil end
+    local headers = { ["Content-Type"] = "application/json", apikey = client_key }
+    -- Millennium 3.6.3's http.post wrapper drops the method, payload and headers.
+    local ok, response = pcall(m_http.request, url, {
+        method = "POST", data = cjson.encode(payload), headers = headers,
+        timeout = 15, follow_redirects = false,
+    })
+    if not ok or not response then return nil end
+    local status = tonumber(response.status)
+    local decoded, data = pcall(cjson.decode, response.body)
+    if not decoded or type(data) ~= "table" then data = nil end
+    if status ~= 200 then return nil, status, data and data.error_code end
+    return data, status
+end
+
+local function save_luie_session(data, previous_refresh_token)
+    if not data or type(data.access_token) ~= "string" or data.access_token == "" then return false end
+    local refresh_token = data.refresh_token or previous_refresh_token
+    if type(refresh_token) ~= "string" or refresh_token == "" then return false end
+    local session = {
+        access_token = data.access_token,
+        refresh_token = refresh_token,
+        expires_at = os.time() + (tonumber(data.expires_in) or 3600),
+    }
+    return m_utils.write_file(luie_session_path(), cjson.encode(session)) ~= false
+end
+
+local function refresh_luie_session()
+    local session = read_luie_session()
+    if not session or (tonumber(session.expires_at) or 0) > os.time() + 120 then return end
+    local data, status = luie_post(LUIE_AUTH_URL .. "token?grant_type=refresh_token",
+        { refresh_token = session.refresh_token }, LUIE_CLIENT_KEY)
+    if status == 400 or status == 401 then
+        drop_file(luie_session_path())
+    elseif data then
+        save_luie_session(data, session.refresh_token)
+    end
+end
+
+function LuieSignIn(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        local code = tostring(parse_payload(payload).code or ""):match("^%s*(.-)%s*$"):upper()
+        if #code ~= 6 or not code:match("^[A-Z0-9]+$") then
+            return { success = false, error = "Enter a six-character lua.tools login code." }
+        end
+        local redeemed, status = luie_post("https://lua.tools/api/auth/code/redeem", { code = code })
+        if not redeemed or type(redeemed.token) ~= "string" or redeemed.token == "" then
+            local error_text = "Could not redeem the lua.tools login code."
+            if status == 400 or status == 404 or status == 410 then
+                error_text = "The lua.tools login code is invalid or expired."
+            end
+            return { success = false, error = error_text }
+        end
+        local data = luie_post(LUIE_AUTH_URL .. "verify",
+            { type = "magiclink", token_hash = redeemed.token }, LUIE_CLIENT_KEY)
+        if not save_luie_session(data) then
+            return { success = false, error = "Could not start the lua.tools session." }
+        end
+        return { success = true }
+    end)
+    if not ok then return json_err("Could not sign in to lua.tools.") end
+    return json_ok(res)
+end
+
+function LuieSignOut(contentScriptQuery, payload)
+    local path = luie_session_path()
+    drop_file(path)
+    if fs.exists(path) then return json_err("Could not remove the lua.tools session.") end
+    return json_ok({ success = true })
+end
+
+local discord_attempt
+local discord_sequence = 0
+
+local function clear_discord_attempt()
+    if not discord_attempt then return end
+    drop_file(discord_attempt.launcher)
+    drop_file(discord_attempt.result)
+    discord_attempt = nil
+end
+
+function LuieDiscordStart(contentScriptQuery, payload)
+    local ok, res = pcall(function()
+        if discord_attempt then
+            if os.time() < discord_attempt.deadline then
+                return { success = true, attempt = discord_attempt.id }
+            end
+            clear_discord_attempt()
+        end
+        discord_sequence = discord_sequence + 1
+        local id = tostring(os.time()) .. "_" .. discord_sequence
+        local path = fs.join(ensure_data_dir(), "luie_discord_" .. id)
+        local launcher, result = path .. ".cmd", path .. ".json"
+        local script = fs.join(backend_dir(), "scripts", "ostlua_discord.ps1")
+        discord_attempt = { id = id, launcher = launcher, result = result, deadline = os.time() + 310 }
+        local body = "@echo off\r\n" ..
+            'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' ..
+            script .. '" -Launcher "' .. launcher .. '" -ResultFile "' .. result .. '"\r\n'
+        if m_utils.write_file(launcher, body) == false then error("launcher write failed") end
+        m_utils.exec('start /b cmd /C "' .. launcher .. '"')
+        return { success = true, attempt = id }
+    end)
+    if not ok then
+        clear_discord_attempt()
+        return json_err("Could not start Discord sign-in.")
+    end
+    return json_ok(res)
+end
+
+function LuieDiscordPoll(contentScriptQuery, payload)
+    local attempt = discord_attempt
+    if not attempt or parse_payload(payload).attempt ~= attempt.id then
+        return json_err("Discord sign-in is no longer active.")
+    end
+    local ok, res = pcall(function()
+        if not fs.exists(attempt.result) then
+            if os.time() < attempt.deadline then return { success = true, waiting = true } end
+            clear_discord_attempt()
+            return { success = false, error = "Discord sign-in timed out." }
+        end
+        local raw = m_utils.read_file(attempt.result)
+        clear_discord_attempt()
+        local reply = cjson.decode(raw)
+        if type(reply.code) ~= "string" or type(reply.verifier) ~= "string" then
+            return { success = false, error = reply.error or "Discord did not return a sign-in result." }
+        end
+        local data, status, error_code = luie_post(LUIE_AUTH_URL .. "token?grant_type=pkce",
+            { auth_code = reply.code, code_verifier = reply.verifier }, LUIE_CLIENT_KEY)
+        if error_code == "flow_state_not_found" or error_code == "flow_state_expired" then
+            return { success = false, error = "This Discord sign-in expired. Start a new sign-in from OSTLua." }
+        end
+        if not status then
+            return { success = false, error = "Could not reach lua.tools to finish Discord sign-in. Try again." }
+        end
+        if status ~= 200 then
+            return { success = false, error = "lua.tools rejected Discord sign-in (HTTP " .. status .. ")." }
+        end
+        if not save_luie_session(data) then
+            return { success = false, error = "Could not save the lua.tools session. Try signing in again." }
+        end
+        return { success = true }
+    end)
+    if not ok then
+        clear_discord_attempt()
+        return json_err("Could not finish Discord sign-in.")
+    end
+    return json_ok(res)
+end
+
+function LuieDiscordCancel(contentScriptQuery, payload)
+    if discord_attempt and parse_payload(payload).attempt == discord_attempt.id then
+        clear_discord_attempt()
+    end
+    return json_ok({ success = true })
+end
+
 -- install: launch the PowerShell helper via a launcher .cmd (proven pattern),
 -- fully detached. The frontend polls HubcapInstallStatus for the result.
 function HubcapInstall(contentScriptQuery, payload)
@@ -353,7 +533,14 @@ function HubcapInstall(contentScriptQuery, payload)
         pcall(fs.remove, result_file)
         -- write the ordered source list (main first, then fallbacks if enabled)
         local sources_file = fs.join(ensure_data_dir(), "sources_" .. appid .. ".json")
-        m_utils.write_file(sources_file, cjson.encode(build_source_order(appid, read_config())))
+        local order = build_source_order(appid, read_config())
+        for _, source in ipairs(order) do
+            if source.id == "luie" then
+                pcall(refresh_luie_session)
+                break
+            end
+        end
+        m_utils.write_file(sources_file, cjson.encode(order))
         local args = '-AppId ' .. appid .. ' -SteamPath "' .. s .. '" -PluginDir "' .. pd ..
                      '" -ResultFile "' .. result_file .. '" -SourcesFile "' .. sources_file .. '"'
         local launcher = fs.join(ensure_data_dir(), "run_install_" .. appid .. ".cmd")
@@ -783,7 +970,8 @@ function HubcapGetConfig(contentScriptQuery, payload)
         local srcs = {}
         for _, s in ipairs(SOURCES) do srcs[#srcs + 1] = { id = s.id, name = s.name, keyed = s.auth == true } end
         return { success = true, hasKey = #key > 0, apiKeyMasked = masked, apiBase = cfg.api_base or "",
-                 sources = srcs, mainSource = cfg.main_source or "hubcap", fallback = cfg.fallback == true }
+                 sources = srcs, mainSource = cfg.main_source or "hubcap", fallback = cfg.fallback == true,
+                 luieSignedIn = read_luie_session() ~= nil }
     end)
     if not ok then return json_err(res) end
     return json_ok(res)
@@ -961,7 +1149,10 @@ local function on_load()
     pcall(millennium.ready)
 end
 
-local function on_unload() log("unloading") end
+local function on_unload()
+    clear_discord_attempt()
+    log("unloading")
+end
 local function on_frontend_loaded() copy_and_inject_webkit() end
 
 return {

@@ -227,7 +227,8 @@
       var row = el('<div class="hubcap-src"><span class="lbl">Source</span></div>');
       var sel = document.createElement("select"); sel.className = "hubcap-select sm";
       sources.forEach(function (s) {
-        var suffix = s.id === "hubcap" ? " [Recommended] (Needs API Key)" : (s.keyed ? " (Needs API Key)" : "");
+        var suffix = s.id === "hubcap" ? " [Recommended] (Needs API Key)" :
+          (s.id === "luie" ? " (lua.tools sign-in)" : (s.keyed ? " (Needs API Key)" : ""));
         var o = new Option(s.name + suffix, s.id);
         if (s.id === main) o.selected = true;
         sel.appendChild(o);
@@ -237,13 +238,108 @@
         ' /><span>Fall back to other sources</span></label>');
       row.appendChild(lab);
       host.appendChild(row);
-      function save() {
-        call("HubcapSetSourcePrefs", { mainSource: sel.value, fallback: lab.querySelector("input").checked })
-          .then(function () { toast("Source: " + sel.options[sel.selectedIndex].text.replace(/ \[Recommended\]| \(Needs API Key\)/g, "") + (lab.querySelector("input").checked ? " + fallback" : "")); });
+      var account = renderLuieAccount(host, c.luieSignedIn);
+      function updateAccount() {
+        account.hidden = sel.value !== "luie" && !lab.querySelector("input").checked;
       }
+      function save() {
+        updateAccount();
+        call("HubcapSetSourcePrefs", { mainSource: sel.value, fallback: lab.querySelector("input").checked })
+          .then(function () { toast("Source: " + sel.options[sel.selectedIndex].text.replace(/ \[Recommended\]| \(Needs API Key\)| \(lua\.tools sign-in\)/g, "") + (lab.querySelector("input").checked ? " + fallback" : "")); });
+      }
+      updateAccount();
       sel.addEventListener("change", save);
       lab.querySelector("input").addEventListener("change", save);
     });
+  }
+
+  function renderLuieAccount(host, signedIn) {
+    var account = document.createElement("div");
+    host.appendChild(account);
+    var attempt = "";
+
+    function cancelDiscord() {
+      if (!attempt) return;
+      call("LuieDiscordCancel", { attempt: attempt });
+      attempt = "";
+      render();
+    }
+
+    function pollDiscord(id) {
+      if (attempt !== id) return;
+      if (!account.isConnected) { cancelDiscord(); return; }
+      call("LuieDiscordPoll", { attempt: id }).then(function (r) {
+        if (attempt !== id) return;
+        if (r && r.success && r.waiting) {
+          setTimeout(function () { pollDiscord(id); }, 1000);
+          return;
+        }
+        attempt = "";
+        if (r && r.success) {
+          signedIn = true;
+        } else {
+          call("LuieDiscordCancel", { attempt: id });
+          toast((r && r.error) || "Discord sign-in failed", false);
+        }
+        render();
+      });
+    }
+
+    function render() {
+      account.innerHTML = "";
+      if (attempt) {
+        var waiting = el('<div class="hubcap-key"><span>Finish signing in with Discord in your browser</span>' +
+          '<button class="hubcap-btn g">Cancel</button></div>');
+        account.appendChild(waiting);
+        waiting.querySelector("button").addEventListener("click", cancelDiscord);
+        return;
+      }
+      if (!signedIn) {
+        var discord = el('<div class="hubcap-key"><button class="hubcap-btn p">Sign in with Discord</button></div>');
+        account.appendChild(discord);
+        var discordButton = discord.querySelector("button");
+        discordButton.addEventListener("click", function () {
+          discordButton.disabled = true;
+          button.disabled = true;
+          call("LuieDiscordStart", {}).then(function (r) {
+            if (!r || !r.success || !r.attempt) {
+              discordButton.disabled = false;
+              button.disabled = false;
+              toast((r && r.error) || "Could not start Discord sign-in", false);
+              return;
+            }
+            attempt = r.attempt;
+            render();
+            pollDiscord(attempt);
+          });
+        });
+      }
+      var row = signedIn
+        ? el('<div class="hubcap-key"><span>Luie signed in</span><button class="hubcap-btn g">Sign out</button></div>')
+        : el('<div class="hubcap-key"><span>Or run /login in the LuaTools Discord</span>' +
+          '<input type="password" aria-label="lua.tools login code" placeholder="Six-character code" maxlength="6" autocomplete="one-time-code" />' +
+          '<button class="hubcap-btn g">Use code</button></div>');
+      account.appendChild(row);
+      var button = row.querySelector("button");
+      var input = row.querySelector("input");
+      button.addEventListener("click", function () {
+        button.disabled = true;
+        if (discordButton) discordButton.disabled = true;
+        call(signedIn ? "LuieSignOut" : "LuieSignIn", input ? { code: input.value.trim() } : {})
+          .then(function (r) {
+            if (r && r.success) {
+              signedIn = !signedIn;
+              render();
+            } else {
+              button.disabled = false;
+              if (discordButton) discordButton.disabled = false;
+              toast((r && r.error) || "lua.tools account request failed", false);
+            }
+          });
+      });
+    }
+    render();
+    return account;
   }
 
   function renderKeyRow(host) {
